@@ -192,10 +192,12 @@ func (h *controlHandler) buildHTTPURL(subdomain string) string {
 func (h *controlHandler) registerTCP(ctrl *proto.ControlConn, reg *proto.RegisterTunnel) {
 	port := reg.RemotePort
 	if port == 0 {
-		_ = ctrl.Send(proto.TypeTunnelError, proto.TunnelError{
-			Name: reg.Name, Error: "remote_port required for TCP tunnels",
-		})
-		return
+		var err error
+		port, err = h.server.pickTCPPort()
+		if err != nil {
+			_ = ctrl.Send(proto.TypeTunnelError, proto.TunnelError{Name: reg.Name, Error: err.Error()})
+			return
+		}
 	}
 
 	if len(h.server.cfg.AllowedPorts) > 0 {

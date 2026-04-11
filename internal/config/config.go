@@ -10,6 +10,8 @@ type ServerConfig struct {
 	TLSKey       string
 	ACMECache    string
 	AllowedPorts []int
+	TCPPortMin   int
+	TCPPortMax   int
 }
 
 // ClientConfig holds all client-side settings (from flags or YAML).

@@ -93,6 +93,19 @@ func (s *Server) Run() error {
 	return nil
 }
 
+// pickTCPPort finds the first free port in the configured TCP range.
+func (s *Server) pickTCPPort() (int, error) {
+	if s.cfg.TCPPortMin == 0 {
+		return 0, fmt.Errorf("no TCP port range configured — use --tcp-port-range (e.g. 2200-2300)")
+	}
+	for port := s.cfg.TCPPortMin; port <= s.cfg.TCPPortMax; port++ {
+		if !s.registry.isPortTaken(port) {
+			return port, nil
+		}
+	}
+	return 0, fmt.Errorf("no free port in range %d-%d", s.cfg.TCPPortMin, s.cfg.TCPPortMax)
+}
+
 // adminAuth wraps an admin handler with optional token check.
 func (s *Server) adminAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

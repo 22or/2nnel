@@ -81,13 +81,18 @@ func parseTunnelSpecs(specs []string) ([]config.TunnelConfig, error) {
 		}
 
 		name := parts[0]
-		// Check if TCP: name:host:port:tcp:remote_port → 5 parts
-		if len(parts) == 5 && parts[3] == "tcp" {
-			remotePort, err := strconv.Atoi(parts[4])
-			if err != nil {
-				return nil, fmt.Errorf("invalid remote port in %q: %w", spec, err)
-			}
+		// TCP: name:host:port:tcp[:remote_port]
+		// remote_port optional — server auto-assigns from range if omitted
+		if (len(parts) == 4 || len(parts) == 5) && parts[3] == "tcp" {
 			localAddr := parts[1] + ":" + parts[2]
+			remotePort := 0
+			if len(parts) == 5 {
+				var err error
+				remotePort, err = strconv.Atoi(parts[4])
+				if err != nil {
+					return nil, fmt.Errorf("invalid remote port in %q: %w", spec, err)
+				}
+			}
 			tunnels = append(tunnels, config.TunnelConfig{
 				Name:       name,
 				Local:      localAddr,

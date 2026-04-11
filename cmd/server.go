@@ -1,8 +1,11 @@
 package cmd
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
+	"strings"
 
 	"github.com/22or/2nnel/internal/config"
 	"github.com/22or/2nnel/internal/server"
@@ -24,6 +27,7 @@ func init() {
 	serverCmd.Flags().String("tls-key", "", "Path to TLS private key (PEM)")
 	serverCmd.Flags().String("acme-cache", "/tmp/2nnel-certs", "Directory for Let's Encrypt cert cache")
 	serverCmd.Flags().IntSlice("allowed-ports", nil, "Allowed TCP ports for TCP tunnels (empty = all)")
+	serverCmd.Flags().String("tcp-port-range", "", "Port range for auto-assigned TCP tunnels (e.g. 2200-2300)")
 }
 
 func runServer(cmd *cobra.Command, args []string) error {
@@ -39,6 +43,11 @@ func runServer(cmd *cobra.Command, args []string) error {
 	tlsKey, _ := f.GetString("tls-key")
 	acmeCache, _ := f.GetString("acme-cache")
 	allowedPorts, _ := f.GetIntSlice("allowed-ports")
+	tcpPortRange, _ := f.GetString("tcp-port-range")
+	tcpPortMin, tcpPortMax, err := parseTCPPortRange(tcpPortRange)
+	if err != nil {
+		return err
+	}
 
 	cfg := &config.ServerConfig{
 		Domain:       domain,
@@ -49,6 +58,8 @@ func runServer(cmd *cobra.Command, args []string) error {
 		TLSKey:       tlsKey,
 		ACMECache:    acmeCache,
 		AllowedPorts: allowedPorts,
+		TCPPortMin:   tcpPortMin,
+		TCPPortMax:   tcpPortMax,
 	}
 
 	if dev {
@@ -61,4 +72,26 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	s := server.New(cfg)
 	return s.Run()
+}
+
+func parseTCPPortRange(s string) (min, max int, err error) {
+	if s == "" {
+		return 0, 0, nil
+	}
+	parts := strings.SplitN(s, "-", 2)
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("--tcp-port-range must be MIN-MAX (e.g. 2200-2300)")
+	}
+	min, err = strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid --tcp-port-range: %w", err)
+	}
+	max, err = strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid --tcp-port-range: %w", err)
+	}
+	if min >= max {
+		return 0, 0, fmt.Errorf("--tcp-port-range min must be < max")
+	}
+	return min, max, nil
 }
