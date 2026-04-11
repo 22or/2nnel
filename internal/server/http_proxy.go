@@ -19,7 +19,7 @@ import (
 func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	subdomain := extractSubdomain(r.Host, s.cfg.Domain)
 	if subdomain == "" {
-		http.Error(w, "no tunnel for this host", http.StatusNotFound)
+		http.Redirect(w, r, "/_2nnel/", http.StatusFound)
 		return
 	}
 
