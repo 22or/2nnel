@@ -19,7 +19,7 @@ import (
 func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	subdomain := extractSubdomain(r.Host, s.cfg.Domain)
 	if subdomain == "" {
-		http.Redirect(w, r, "/_2nnel/", http.StatusFound)
+		s.serveIndex(w, r)
 		return
 	}
 
