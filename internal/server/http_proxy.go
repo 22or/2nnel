@@ -44,6 +44,12 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// WebSocket: hijack and tunnel raw bytes over yamux stream.
+	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		s.handleWSProxy(w, r, entry, te)
+		return
+	}
+
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = "http"
@@ -54,7 +60,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		Transport:     &yamuxTransport{session: entry.session, te: te},
 		FlushInterval: 100 * time.Millisecond,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			slog.Error("proxy error", "subdomain", subdomain, "err", err)
+			slog.Warn("proxy error", "subdomain", subdomain, "err", err)
 			http.Error(w, "tunnel error: "+err.Error(), http.StatusBadGateway)
 		},
 	}
@@ -155,4 +161,49 @@ func (b *streamBody) Close() error {
 	err := b.ReadCloser.Close()
 	_ = b.stream.Close()
 	return err
+}
+
+// handleWSProxy tunnels a WebSocket upgrade request raw over a yamux stream.
+func (s *Server) handleWSProxy(w http.ResponseWriter, r *http.Request, entry *clientEntry, te *tunnelEntry) {
+	stream, err := entry.session.Open()
+	if err != nil {
+		http.Error(w, "open tunnel stream: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer stream.Close()
+
+	// Write stream header so client knows which tunnel to dial.
+	hdr := proto.StreamHeader{TunnelName: te.name, LocalAddr: te.localAddr}
+	hdrBytes, _ := json.Marshal(hdr)
+	hdrBytes = append(hdrBytes, '\n')
+	if _, err := stream.Write(hdrBytes); err != nil {
+		http.Error(w, "write stream header: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	// Forward the original HTTP upgrade request to the client's local service.
+	if err := r.Write(stream); err != nil {
+		http.Error(w, "write request: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	// Hijack the client connection so we can pipe raw bytes.
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "hijack unsupported", http.StatusInternalServerError)
+		return
+	}
+	conn, _, err := hj.Hijack()
+	if err != nil {
+		http.Error(w, "hijack: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer conn.Close()
+
+	te.activeConns.Add(1)
+	defer te.activeConns.Add(-1)
+
+	// cs counts bytes; use pipe (no te) to avoid double-counting.
+	cs := &countingStream{ReadWriteCloser: stream, te: te}
+	pipe(conn, cs)
 }
