@@ -135,10 +135,22 @@ func (s *Server) buildSSEPayload() ssePayload {
 			totals.TotalBytesIn += t.BytesIn
 			totals.TotalBytesOut += t.BytesOut
 
+			endpoint := t.Endpoint
+			if t.Type == "http" && s.cfg.Domain != "" {
+				scheme := "https"
+				if s.cfg.Dev {
+					scheme = "http"
+				}
+				endpoint = scheme + "://" + t.Endpoint + "." + s.cfg.Domain
+				if s.cfg.Dev && s.cfg.Port != 80 && s.cfg.Port != 443 {
+					endpoint += fmt.Sprintf(":%d", s.cfg.Port)
+				}
+			}
+
 			tunnels = append(tunnels, sseTunnel{
 				Name:          t.Name,
 				Type:          t.Type,
-				Endpoint:      t.Endpoint,
+				Endpoint:      endpoint,
 				LocalAddr:     t.LocalAddr,
 				BytesIn:       t.BytesIn,
 				BytesOut:      t.BytesOut,

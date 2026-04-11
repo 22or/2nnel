@@ -28,6 +28,8 @@
     .btn-disconnect { font-size: 0.75rem; padding: 2px 10px; }
     .tunnel-name { font-family: monospace; font-weight: 600; }
     .endpoint { font-family: monospace; color: #79c0ff; font-size: 0.85rem; }
+    a.endpoint { text-decoration: none; }
+    a.endpoint:hover { text-decoration: underline; color: #a5d6ff; }
     .local-addr { font-family: monospace; color: #8b949e; font-size: 0.8rem; }
     .metric-val { font-weight: 600; }
   </style>
@@ -115,7 +117,9 @@ function renderTunnel(t) {
       <span class="${dotCls}"></span>
       <span class="tunnel-name">${escHtml(t.name)}</span>
       ${badge}
-      <span class="endpoint">${escHtml(t.endpoint)}</span>
+      ${t.type === 'http'
+          ? `<a class="endpoint" href="${escHtml(t.endpoint)}" target="_blank" rel="noopener">${escHtml(t.endpoint)}</a>`
+          : `<span class="endpoint">${escHtml(t.endpoint)}</span>`}
       <span class="local-addr">→ ${escHtml(t.local_addr)}</span>
       <span class="ms-auto d-flex gap-3 align-items-center flex-wrap">
         <span><span class="bytes-label">↓</span> <span class="metric-val">${t.bytes_in_human}</span></span>
