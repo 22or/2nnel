@@ -4,8 +4,14 @@
 #
 #   sudo bash install.sh --domain example.com --token mysecret [--cf-token TOKEN]
 #
+# Update an existing install (git pull + rebuild):
+#   sudo bash install.sh --update
+#
 # Expects the 2nnel binary next to this script, or pass --binary ./path/to/2nnel
 set -euo pipefail
+
+REPO_DIR="/opt/2nnel"
+GITHUB_REPO="https://github.com/22or/2nnel"
 
 # ── Parse args ────────────────────────────────────────────────────────────────
 DOMAIN=""
@@ -13,6 +19,7 @@ TOKEN=""
 PORT="443"
 BINARY=""
 CF_TOKEN=""
+UPDATE=0
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -21,19 +28,51 @@ while [[ $# -gt 0 ]]; do
     --port)     PORT="$2";     shift 2 ;;
     --binary)   BINARY="$2";   shift 2 ;;
     --cf-token) CF_TOKEN="$2"; shift 2 ;;
+    --update)   UPDATE=1;      shift   ;;
     -h|--help)
       echo "Usage: $0 --domain example.com --token secret [--port 443] [--binary ./2nnel] [--cf-token CF_TOKEN]"
+      echo "       $0 --update   # git pull + rebuild + restart"
       exit 0 ;;
     *) echo "Unknown arg: $1"; exit 1 ;;
   esac
 done
 
+[[ $EUID -eq 0 ]] || { echo "Run as root: sudo bash $0 $*"; exit 1; }
+
+# ── Update mode ───────────────────────────────────────────────────────────────
+if [[ $UPDATE -eq 1 ]]; then
+  echo "→ Updating 2nnel from GitHub…"
+  if [[ ! -d "$REPO_DIR/.git" ]]; then
+    echo "  ERROR: $REPO_DIR is not a git repo. Run full install first."
+    exit 1
+  fi
+  cd "$REPO_DIR"
+  git pull --ff-only
+  echo "→ Rebuilding…"
+  go build -ldflags="-s -w" -o /usr/local/bin/2nnel .
+  echo "→ Restarting service…"
+  systemctl restart 2nnel
+  systemctl status 2nnel --no-pager -l | head -6
+  echo "✓ Updated"
+  exit 0
+fi
+
 if [[ -z "$DOMAIN" || -z "$TOKEN" ]]; then
   echo "Usage: $0 --domain example.com --token secret [--cf-token TOKEN]"
+  echo "       $0 --update"
   exit 1
 fi
 
-[[ $EUID -eq 0 ]] || { echo "Run as root: sudo bash $0 $*"; exit 1; }
+# ── Clone / update repo on VPS ───────────────────────────────────────────────
+if command -v git &>/dev/null; then
+  if [[ -d "$REPO_DIR/.git" ]]; then
+    echo "→ Updating repo at $REPO_DIR…"
+    git -C "$REPO_DIR" pull --ff-only
+  else
+    echo "→ Cloning repo to $REPO_DIR…"
+    git clone "$GITHUB_REPO" "$REPO_DIR"
+  fi
+fi
 
 # ── Find binary ───────────────────────────────────────────────────────────────
 if [[ -z "$BINARY" ]]; then
@@ -48,15 +87,16 @@ fi
 
 if [[ -z "$BINARY" || ! -f "$BINARY" ]]; then
   if command -v go &>/dev/null; then
-    echo "→ No binary found — building from source…"
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    cd "$SCRIPT_DIR"
-    go build -ldflags="-s -w" -o /tmp/2nnel-built .
+    BUILD_SRC="${REPO_DIR:-}"
+    if [[ -z "$BUILD_SRC" || ! -d "$BUILD_SRC" ]]; then
+      BUILD_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    fi
+    echo "→ Building from source ($BUILD_SRC)…"
+    (cd "$BUILD_SRC" && go build -ldflags="-s -w" -o /tmp/2nnel-built .)
     BINARY="/tmp/2nnel-built"
   else
     echo "ERROR: No 2nnel binary found and Go is not installed."
-    echo "  Copy the binary here first:"
-    echo "    scp 2nnel-linux-amd64 root@thisVPS:~/"
+    echo "  Install Go: https://go.dev/dl/ or: apt install golang"
     echo "  Then re-run this script."
     exit 1
   fi
