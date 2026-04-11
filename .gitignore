@@ -1,0 +1,27 @@
+# Binaries
+2nnel
+2nnel-linux-amd64
+2nnel-linux-arm64
+2nnel-darwin-amd64
+2nnel-darwin-arm64
+*.exe
+
+# Build artifacts
+/dist/
+/tmp/
+
+# TLS / cert cache
+*.pem
+*.crt
+*.key
+/certs/
+
+# Go
+vendor/
+
+# Editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

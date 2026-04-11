@@ -1,0 +1,20 @@
+[Unit]
+Description=2nnel reverse tunnel relay server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/2nnel server \
+    --domain your.domain.com \
+    --port 443 \
+    --auth-token changeme \
+    --acme-cache /var/lib/2nnel/certs
+Restart=always
+RestartSec=5
+User=2nnel
+Group=2nnel
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

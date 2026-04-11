@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>2nnel Admin</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+  <style>
+    body { background: #0d1117; }
+    .navbar-brand { font-weight: 700; letter-spacing: -0.5px; }
+    .brand-accent { color: #58a6ff; }
+    .stat-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; }
+    .stat-value { font-size: 2rem; font-weight: 700; color: #e6edf3; }
+    .stat-label { font-size: 0.75rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; }
+    .client-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; }
+    .client-header { background: #1c2128; border-bottom: 1px solid #30363d; border-radius: 8px 8px 0 0; }
+    .tunnel-row { border-bottom: 1px solid #21262d; }
+    .tunnel-row:last-child { border-bottom: none; }
+    .badge-http { background: #1f6feb; }
+    .badge-tcp  { background: #388bfd22; color: #79c0ff; border: 1px solid #388bfd55; }
+    .bytes-label { color: #8b949e; font-size: 0.8rem; }
+    .active-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #3fb950; margin-right: 6px; }
+    .active-dot.zero { background: #484f58; }
+    .uptime-badge { font-size: 0.75rem; color: #8b949e; }
+    #status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #3fb950; margin-right: 4px; transition: background 0.3s; }
+    #status-dot.disconnected { background: #f85149; }
+    .empty-state { color: #484f58; }
+    .btn-disconnect { font-size: 0.75rem; padding: 2px 10px; }
+    .tunnel-name { font-family: monospace; font-weight: 600; }
+    .endpoint { font-family: monospace; color: #79c0ff; font-size: 0.85rem; }
+    .local-addr { font-family: monospace; color: #8b949e; font-size: 0.8rem; }
+    .metric-val { font-weight: 600; }
+  </style>
+</head>
+<body>
+
+<nav class="navbar navbar-dark px-4 py-2" style="background:#161b22; border-bottom:1px solid #30363d;">
+  <span class="navbar-brand mb-0">
+    <span class="brand-accent">2</span>nnel
+    <span class="text-secondary fw-normal ms-2" style="font-size:0.85rem;">Admin</span>
+  </span>
+  <div class="d-flex align-items-center gap-3">
+    <span id="uptime-badge" class="uptime-badge">uptime: —</span>
+    <span>
+      <span id="status-dot" class="disconnected"></span>
+      <span id="status-text" style="font-size:0.8rem; color:#8b949e;">connecting…</span>
+    </span>
+  </div>
+</nav>
+
+<div class="container-fluid px-4 py-4">
+
+  <!-- Stat cards -->
+  <div class="row g-3 mb-4">
+    <div class="col-6 col-md-3">
+      <div class="stat-card p-3">
+        <div class="stat-value" id="stat-clients">—</div>
+        <div class="stat-label">Clients</div>
+      </div>
+    </div>
+    <div class="col-6 col-md-3">
+      <div class="stat-card p-3">
+        <div class="stat-value" id="stat-http">—</div>
+        <div class="stat-label">HTTP Tunnels</div>
+      </div>
+    </div>
+    <div class="col-6 col-md-3">
+      <div class="stat-card p-3">
+        <div class="stat-value" id="stat-tcp">—</div>
+        <div class="stat-label">TCP Tunnels</div>
+      </div>
+    </div>
+    <div class="col-6 col-md-3">
+      <div class="stat-card p-3">
+        <div class="stat-value" id="stat-bytes">—</div>
+        <div class="stat-label">Total Traffic</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Client cards -->
+  <div id="clients-container">
+    <div class="empty-state text-center py-5">
+      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="mb-3">
+        <path d="M8.5 12.5l2 2 5-5"/>
+        <circle cx="12" cy="12" r="9"/>
+      </svg>
+      <p>No clients connected.</p>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const token = new URLSearchParams(location.search).get('token') || '';
+const authQ = token ? '?token=' + encodeURIComponent(token) : '';
+
+function fmtBytes(n) {
+  if (n >= 1073741824) return (n / 1073741824).toFixed(1) + ' GB';
+  if (n >= 1048576)    return (n / 1048576).toFixed(1) + ' MB';
+  if (n >= 1024)       return (n / 1024).toFixed(1) + ' KB';
+  return n + ' B';
+}
+
+function renderTunnel(t) {
+  const dotCls = t.active_conns > 0 ? 'active-dot' : 'active-dot zero';
+  const badge = t.type === 'http'
+    ? `<span class="badge badge-http">HTTP</span>`
+    : `<span class="badge badge-tcp">TCP</span>`;
+  const reqs = t.type === 'http'
+    ? `<span class="metric-val">${t.requests}</span> <span class="bytes-label">req</span>`
+    : '';
+  return `
+    <div class="tunnel-row px-4 py-2 d-flex flex-wrap align-items-center gap-3">
+      <span class="${dotCls}"></span>
+      <span class="tunnel-name">${escHtml(t.name)}</span>
+      ${badge}
+      <span class="endpoint">${escHtml(t.endpoint)}</span>
+      <span class="local-addr">→ ${escHtml(t.local_addr)}</span>
+      <span class="ms-auto d-flex gap-3 align-items-center flex-wrap">
+        <span><span class="bytes-label">↓</span> <span class="metric-val">${t.bytes_in_human}</span></span>
+        <span><span class="bytes-label">↑</span> <span class="metric-val">${t.bytes_out_human}</span></span>
+        ${reqs}
+        ${t.active_conns > 0 ? `<span class="badge bg-success">${t.active_conns} active</span>` : ''}
+      </span>
+    </div>`;
+}
+
+function renderClient(c) {
+  const tunnelRows = c.tunnels.length
+    ? c.tunnels.map(renderTunnel).join('')
+    : `<div class="px-4 py-2 text-secondary" style="font-size:0.85rem;">No tunnels registered.</div>`;
+
+  return `
+    <div class="client-card mb-3">
+      <div class="client-header px-4 py-2 d-flex align-items-center gap-3 flex-wrap">
+        <span class="font-monospace fw-bold" style="color:#e6edf3;">${escHtml(c.short_id)}</span>
+        <span class="text-secondary" style="font-size:0.8rem;">${escHtml(c.remote)}</span>
+        <span class="text-secondary" style="font-size:0.8rem;">· connected ${escHtml(c.connected_ago)}</span>
+        <span class="ms-auto">
+          <button class="btn btn-outline-danger btn-disconnect"
+            onclick="disconnect('${escHtml(c.id)}')">Disconnect</button>
+        </span>
+      </div>
+      ${tunnelRows}
+    </div>`;
+}
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+
+function render(data) {
+  // Stats
+  document.getElementById('stat-clients').textContent = data.totals.clients;
+  document.getElementById('stat-http').textContent    = data.totals.http_tunnels;
+  document.getElementById('stat-tcp').textContent     = data.totals.tcp_tunnels;
+  const totalBytes = (data.totals.total_bytes_in || 0) + (data.totals.total_bytes_out || 0);
+  document.getElementById('stat-bytes').textContent   = fmtBytes(totalBytes);
+
+  // Uptime
+  const u = data.uptime_seconds;
+  const h = Math.floor(u / 3600), m = Math.floor((u % 3600) / 60), sec = Math.floor(u % 60);
+  document.getElementById('uptime-badge').textContent =
+    'uptime: ' + (h ? h+'h '+m+'m' : m ? m+'m '+sec+'s' : sec+'s');
+
+  // Clients
+  const container = document.getElementById('clients-container');
+  if (!data.clients || data.clients.length === 0) {
+    container.innerHTML = `
+      <div class="empty-state text-center py-5">
+        <p class="mb-0">No clients connected.</p>
+      </div>`;
+  } else {
+    container.innerHTML = data.clients.map(renderClient).join('');
+  }
+}
+
+async function disconnect(id) {
+  if (!confirm('Disconnect client ' + id.slice(0,8) + '?')) return;
+  try {
+    const r = await fetch('/_2nnel/clients/' + encodeURIComponent(id) + '/disconnect' + authQ, {method:'POST'});
+    if (!r.ok) alert('Error: ' + await r.text());
+  } catch(e) { alert('Error: ' + e); }
+}
+
+// SSE connection with auto-reconnect
+let es;
+function connect() {
+  const dot  = document.getElementById('status-dot');
+  const text = document.getElementById('status-text');
+  dot.className = 'disconnected';
+  text.textContent = 'connecting…';
+
+  es = new EventSource('/_2nnel/stream' + authQ);
+
+  es.onopen = () => {
+    dot.className = '';
+    text.textContent = 'live';
+  };
+
+  es.onmessage = e => {
+    try { render(JSON.parse(e.data)); } catch(err) { console.error(err); }
+  };
+
+  es.onerror = () => {
+    dot.className = 'disconnected';
+    text.textContent = 'reconnecting…';
+    es.close();
+    setTimeout(connect, 3000);
+  };
+}
+
+connect();
+</script>
+</body>
+</html>
