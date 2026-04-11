@@ -73,25 +73,6 @@ func (s *Server) Run() error {
 		slog.Info("listening (HTTPS/WSS)", "addr", addr)
 		srv = &http.Server{Handler: mux, TLSConfig: tls.cfg}
 
-		// Port 80: serve ACME HTTP-01 challenge + redirect everything else to HTTPS.
-		go func() {
-			var h80 http.Handler
-			if tls.manager != nil {
-				h80 = tls.manager.HTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					target := "https://" + r.Host + r.URL.RequestURI()
-					http.Redirect(w, r, target, http.StatusMovedPermanently)
-				}))
-			} else {
-				h80 = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					target := "https://" + r.Host + r.URL.RequestURI()
-					http.Redirect(w, r, target, http.StatusMovedPermanently)
-				})
-			}
-			slog.Info("listening (HTTP redirect + ACME)", "addr", ":80")
-			if err := http.ListenAndServe(":80", h80); err != nil {
-				slog.Error("port 80 listener failed", "err", err)
-			}
-		}()
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
