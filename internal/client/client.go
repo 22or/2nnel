@@ -3,9 +3,11 @@ package client
 import (
 	"log/slog"
 	"math"
+	"os"
 	"time"
 
 	"github.com/22or/2nnel/internal/config"
+	"gopkg.in/yaml.v3"
 )
 
 // Client is the 2nnel tunnel client.
@@ -27,11 +29,22 @@ func (c *Client) Run() error {
 		factor    = 2.0
 	)
 
+	var save func(*config.ClientConfig)
+	if c.cfg.ConfigFile != "" {
+		save = func(cfg *config.ClientConfig) {
+			if err := saveConfig(cfg); err != nil {
+				slog.Warn("save config failed", "err", err)
+			}
+		}
+	}
+
 	attempt := 0
 	for {
 		slog.Info("connecting to server", "url", c.cfg.Server, "attempt", attempt+1)
 
 		sess := newSession(c.cfg)
+		sess.onSave = save
+
 		err := sess.connect()
 		if err != nil {
 			delay := time.Duration(math.Min(
@@ -51,4 +64,13 @@ func (c *Client) Run() error {
 		sess.run()
 		slog.Warn("session ended, reconnecting")
 	}
+}
+
+// saveConfig writes cfg to cfg.ConfigFile as YAML.
+func saveConfig(cfg *config.ClientConfig) error {
+	b, err := yaml.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(cfg.ConfigFile, b, 0600)
 }

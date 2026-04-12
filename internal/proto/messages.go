@@ -16,6 +16,8 @@ const (
 	TypeTunnelRegistered = "tunnel_registered"
 	TypeTunnelError      = "tunnel_error"
 	TypeHeartbeat        = "heartbeat"
+	TypeAddTunnel        = "add_tunnel"
+	TypeRemoveTunnel     = "remove_tunnel"
 )
 
 // Envelope wraps all control-channel messages.
@@ -69,6 +71,20 @@ type TunnelError struct {
 // Heartbeat is sent by both sides periodically.
 type Heartbeat struct {
 	Timestamp int64 `json:"timestamp"`
+}
+
+// AddTunnel is sent server→client to dynamically register a new tunnel.
+type AddTunnel struct {
+	Name       string `json:"name"`
+	Type       string `json:"type"`
+	LocalAddr  string `json:"local_addr"`
+	Subdomain  string `json:"subdomain,omitempty"`
+	RemotePort int    `json:"remote_port,omitempty"`
+}
+
+// RemoveTunnel is sent server→client to tear down a tunnel by name.
+type RemoveTunnel struct {
+	Name string `json:"name"`
 }
 
 // StreamHeader is the first thing written on every data stream by the server.

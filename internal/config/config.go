@@ -16,9 +16,10 @@ type ServerConfig struct {
 
 // ClientConfig holds all client-side settings (from flags or YAML).
 type ClientConfig struct {
-	Server    string         `mapstructure:"server"     yaml:"server"`
-	AuthToken string         `mapstructure:"auth_token" yaml:"auth_token"`
-	Tunnels   []TunnelConfig `mapstructure:"tunnels"    yaml:"tunnels"`
+	Server     string         `mapstructure:"server"     yaml:"server"`
+	AuthToken  string         `mapstructure:"auth_token" yaml:"auth_token"`
+	Tunnels    []TunnelConfig `mapstructure:"tunnels"    yaml:"tunnels"`
+	ConfigFile string         `mapstructure:"-"          yaml:"-"` // not persisted
 }
 
 // TunnelConfig describes one tunnel.

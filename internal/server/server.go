@@ -170,6 +170,18 @@ type clientEntry struct {
 	session     *yamux.Session
 	mu          sync.RWMutex
 	tunnels     []*tunnelEntry
+	ctrl        *proto.ControlConn
+	ctrlMu      sync.Mutex
+}
+
+// sendMsg sends a control message to this client.
+func (e *clientEntry) sendMsg(msgType string, v any) error {
+	e.ctrlMu.Lock()
+	defer e.ctrlMu.Unlock()
+	if e.ctrl == nil {
+		return fmt.Errorf("no control connection")
+	}
+	return e.ctrl.Send(msgType, v)
 }
 
 // tunnelEntry holds config + live metrics for one registered tunnel.
@@ -266,6 +278,33 @@ func (reg *Registry) isPortTaken(port int) bool {
 	defer reg.mu.RUnlock()
 	_, ok := reg.byPort[port]
 	return ok
+}
+
+// removeTunnelByName removes a single tunnel from a client by tunnel name.
+func (reg *Registry) removeTunnelByName(clientID, tunnelName string) bool {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	entry, ok := reg.byID[clientID]
+	if !ok {
+		return false
+	}
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	for i, t := range entry.tunnels {
+		if t.name == tunnelName {
+			if t.tunnelType == "http" {
+				delete(reg.bySubdomain, t.subdomain)
+			} else {
+				delete(reg.byPort, t.remotePort)
+				if t.tcpLn != nil {
+					_ = t.tcpLn.Close()
+				}
+			}
+			entry.tunnels = append(entry.tunnels[:i], entry.tunnels[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
 // disconnectClient closes a client session by ID. Returns false if not found.

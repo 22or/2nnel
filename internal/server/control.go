@@ -45,6 +45,7 @@ func (h *controlHandler) run() {
 		remote:      h.remote,
 		connectedAt: time.Now(),
 		session:     h.session,
+		ctrl:        ctrl,
 	}
 	h.server.registry.addClient(entry)
 	defer h.server.registry.removeClient(h.clientID)

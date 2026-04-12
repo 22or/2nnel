@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/22or/2nnel/internal/config"
@@ -14,15 +15,18 @@ import (
 
 // session holds the live connection state for one connect attempt.
 type session struct {
-	cfg     *config.ClientConfig
-	ws      *websocket.Conn
-	mux     *yamux.Session
-	ctrl    *proto.ControlConn
+	cfg    *config.ClientConfig
+	cfgMu  sync.Mutex
+	ws     *websocket.Conn
+	mux    *yamux.Session
+	ctrl   *proto.ControlConn
+	onSave func(*config.ClientConfig) // called after tunnel list changes
 }
 
 func newSession(cfg *config.ClientConfig) *session {
 	return &session{cfg: cfg}
 }
+
 
 // connect dials the server, upgrades to yamux, authenticates, and registers tunnels.
 func (s *session) connect() error {
@@ -154,6 +158,24 @@ func (s *session) controlLoop() {
 		switch env.Type {
 		case proto.TypeHeartbeat:
 			_ = s.ctrl.Send(proto.TypeHeartbeat, proto.Heartbeat{Timestamp: time.Now().UnixMilli()})
+		case proto.TypeAddTunnel:
+			var at proto.AddTunnel
+			if err := env.Unmarshal(&at); err == nil {
+				s.dynamicAdd(at)
+			}
+		case proto.TypeRemoveTunnel:
+			var rt proto.RemoveTunnel
+			if err := env.Unmarshal(&rt); err == nil {
+				s.dynamicRemove(rt.Name)
+			}
+		case proto.TypeTunnelRegistered:
+			var tr proto.TunnelRegistered
+			_ = env.Unmarshal(&tr)
+			slog.Info("tunnel ready", "name", tr.Name, "url", tr.PublicURL)
+		case proto.TypeTunnelError:
+			var te proto.TunnelError
+			_ = env.Unmarshal(&te)
+			slog.Error("tunnel error", "name", te.Name, "err", te.Error)
 		default:
 			slog.Debug("unhandled control message", "type", env.Type)
 		}
@@ -170,5 +192,55 @@ func (s *session) acceptLoop() {
 			return
 		}
 		go handleDataStream(stream, s.cfg)
+	}
+}
+
+// dynamicAdd registers a new tunnel at runtime (sent by server from dashboard).
+func (s *session) dynamicAdd(at proto.AddTunnel) {
+	msg := proto.RegisterTunnel{
+		Name:       at.Name,
+		Type:       at.Type,
+		LocalAddr:  at.LocalAddr,
+		Subdomain:  at.Subdomain,
+		RemotePort: at.RemotePort,
+	}
+	if msg.Subdomain == "" && msg.Type == "http" {
+		msg.Subdomain = msg.Name
+	}
+	if err := s.ctrl.Send(proto.TypeRegisterTunnel, msg); err != nil {
+		slog.Error("dynamic add tunnel failed", "name", at.Name, "err", err)
+		return
+	}
+	// Persist immediately; response handled in controlLoop switch.
+	s.cfgMu.Lock()
+	s.cfg.Tunnels = append(s.cfg.Tunnels, config.TunnelConfig{
+		Name:       at.Name,
+		Local:      at.LocalAddr,
+		Type:       at.Type,
+		Subdomain:  at.Subdomain,
+		RemotePort: at.RemotePort,
+	})
+	cfg := s.cfg
+	s.cfgMu.Unlock()
+	if s.onSave != nil {
+		s.onSave(cfg)
+	}
+}
+
+// dynamicRemove unregisters a tunnel at runtime.
+func (s *session) dynamicRemove(name string) {
+	s.cfgMu.Lock()
+	tunnels := make([]config.TunnelConfig, 0, len(s.cfg.Tunnels))
+	for _, t := range s.cfg.Tunnels {
+		if t.Name != name {
+			tunnels = append(tunnels, t)
+		}
+	}
+	s.cfg.Tunnels = tunnels
+	cfg := s.cfg
+	s.cfgMu.Unlock()
+	slog.Info("tunnel removed", "name", name)
+	if s.onSave != nil {
+		s.onSave(cfg)
 	}
 }

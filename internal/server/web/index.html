@@ -26,6 +26,14 @@
     #status-dot.disconnected { background: #f85149; }
     .empty-state { color: #484f58; }
     .btn-disconnect { font-size: 0.75rem; padding: 2px 10px; }
+    .btn-remove-tunnel { font-size: 0.7rem; padding: 1px 8px; }
+    .modal-dark { background: #161b22; border: 1px solid #30363d; }
+    .modal-dark .modal-header { border-bottom: 1px solid #30363d; }
+    .modal-dark .modal-footer { border-top: 1px solid #30363d; }
+    .form-control-dark { background: #0d1117; border: 1px solid #30363d; color: #e6edf3; }
+    .form-control-dark:focus { background: #0d1117; border-color: #58a6ff; color: #e6edf3; box-shadow: 0 0 0 2px rgba(88,166,255,.25); }
+    .form-select-dark { background-color: #0d1117; border: 1px solid #30363d; color: #e6edf3; }
+    .form-select-dark:focus { border-color: #58a6ff; box-shadow: 0 0 0 2px rgba(88,166,255,.25); }
     .tunnel-name { font-family: monospace; font-weight: 600; }
     .endpoint { font-family: monospace; color: #79c0ff; font-size: 0.85rem; }
     a.endpoint { text-decoration: none; }
@@ -93,6 +101,50 @@
 
 </div>
 
+<!-- Add Tunnel Modal -->
+<div class="modal fade" id="addTunnelModal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content modal-dark text-light">
+      <div class="modal-header">
+        <h5 class="modal-title">Add Tunnel</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="modal-client-id">
+        <div class="mb-3">
+          <label class="form-label text-secondary small">Tunnel Name</label>
+          <input id="t-name" type="text" class="form-control form-control-dark" placeholder="myapp">
+        </div>
+        <div class="mb-3">
+          <label class="form-label text-secondary small">Type</label>
+          <select id="t-type" class="form-select form-select-dark" onchange="toggleTunnelFields()">
+            <option value="http">HTTP</option>
+            <option value="tcp">TCP</option>
+          </select>
+        </div>
+        <div class="mb-3">
+          <label class="form-label text-secondary small">Local Address</label>
+          <input id="t-local" type="text" class="form-control form-control-dark" placeholder="localhost:3000">
+        </div>
+        <div id="t-subdomain-group" class="mb-3">
+          <label class="form-label text-secondary small">Subdomain <span class="text-secondary">(leave blank to use name)</span></label>
+          <input id="t-subdomain" type="text" class="form-control form-control-dark" placeholder="myapp">
+        </div>
+        <div id="t-port-group" class="mb-3 d-none">
+          <label class="form-label text-secondary small">Remote Port <span class="text-secondary">(leave blank for auto)</span></label>
+          <input id="t-port" type="number" class="form-control form-control-dark" placeholder="auto">
+        </div>
+        <div id="modal-error" class="text-danger small d-none"></div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-primary" onclick="submitAddTunnel()">Add</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script>
 const token = new URLSearchParams(location.search).get('token') || '';
 const authQ = token ? '?token=' + encodeURIComponent(token) : '';
@@ -126,6 +178,8 @@ function renderTunnel(t) {
         <span><span class="bytes-label">↑</span> <span class="metric-val">${t.bytes_out_human}</span></span>
         ${reqs}
         ${t.active_conns > 0 ? `<span class="badge bg-success">${t.active_conns} active</span>` : ''}
+        <button class="btn btn-outline-secondary btn-remove-tunnel"
+          onclick="removeTunnel('${escHtml(t.client_id)}','${escHtml(t.name)}')">Remove</button>
       </span>
     </div>`;
 }
@@ -141,7 +195,9 @@ function renderClient(c) {
         <span class="font-monospace fw-bold" style="color:#e6edf3;">${escHtml(c.short_id)}</span>
         <span class="text-secondary" style="font-size:0.8rem;">${escHtml(c.remote)}</span>
         <span class="text-secondary" style="font-size:0.8rem;">· connected ${escHtml(c.connected_ago)}</span>
-        <span class="ms-auto">
+        <span class="ms-auto d-flex gap-2">
+          <button class="btn btn-outline-primary btn-disconnect"
+            onclick="openAddTunnel('${escHtml(c.id)}')">+ Tunnel</button>
           <button class="btn btn-outline-danger btn-disconnect"
             onclick="disconnect('${escHtml(c.id)}')">Disconnect</button>
         </span>
@@ -190,6 +246,71 @@ async function disconnect(id) {
     const r = await fetch('/_2nnel/clients/' + encodeURIComponent(id) + '/disconnect' + authQ, {method:'POST'});
     if (!r.ok) alert('Error: ' + await r.text());
   } catch(e) { alert('Error: ' + e); }
+}
+
+async function removeTunnel(clientId, tunnelName) {
+  if (!confirm('Remove tunnel "' + tunnelName + '"?')) return;
+  try {
+    const r = await fetch('/_2nnel/clients/' + encodeURIComponent(clientId) + '/tunnels/' + encodeURIComponent(tunnelName) + authQ, {method:'DELETE'});
+    if (!r.ok) alert('Error: ' + await r.text());
+  } catch(e) { alert('Error: ' + e); }
+}
+
+let addTunnelModal;
+function openAddTunnel(clientId) {
+  document.getElementById('modal-client-id').value = clientId;
+  document.getElementById('t-name').value = '';
+  document.getElementById('t-local').value = '';
+  document.getElementById('t-subdomain').value = '';
+  document.getElementById('t-port').value = '';
+  document.getElementById('t-type').value = 'http';
+  document.getElementById('modal-error').classList.add('d-none');
+  toggleTunnelFields();
+  if (!addTunnelModal) addTunnelModal = new bootstrap.Modal(document.getElementById('addTunnelModal'));
+  addTunnelModal.show();
+}
+
+function toggleTunnelFields() {
+  const isTCP = document.getElementById('t-type').value === 'tcp';
+  document.getElementById('t-subdomain-group').classList.toggle('d-none', isTCP);
+  document.getElementById('t-port-group').classList.toggle('d-none', !isTCP);
+}
+
+async function submitAddTunnel() {
+  const clientId = document.getElementById('modal-client-id').value;
+  const name     = document.getElementById('t-name').value.trim();
+  const type     = document.getElementById('t-type').value;
+  const localAddr = document.getElementById('t-local').value.trim();
+  const subdomain = document.getElementById('t-subdomain').value.trim();
+  const portVal   = document.getElementById('t-port').value.trim();
+  const errEl     = document.getElementById('modal-error');
+
+  if (!name || !localAddr) {
+    errEl.textContent = 'Name and local address required.';
+    errEl.classList.remove('d-none');
+    return;
+  }
+
+  const body = { name, type, local_addr: localAddr };
+  if (type === 'http') body.subdomain = subdomain || name;
+  if (type === 'tcp' && portVal) body.remote_port = parseInt(portVal);
+
+  try {
+    const r = await fetch('/_2nnel/clients/' + encodeURIComponent(clientId) + '/tunnels' + authQ, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    if (r.ok) {
+      addTunnelModal.hide();
+    } else {
+      errEl.textContent = await r.text();
+      errEl.classList.remove('d-none');
+    }
+  } catch(e) {
+    errEl.textContent = String(e);
+    errEl.classList.remove('d-none');
+  }
 }
 
 // SSE connection with auto-reconnect

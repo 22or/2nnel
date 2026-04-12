@@ -4,10 +4,13 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/22or/2nnel/internal/proto"
 )
 
 //go:embed web/index.html
@@ -27,6 +30,17 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/clients/") && strings.HasSuffix(path, "/disconnect") && r.Method == http.MethodPost:
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/clients/"), "/disconnect")
 		s.handleDisconnect(w, r, id)
+	case strings.HasPrefix(path, "/clients/") && strings.HasSuffix(path, "/tunnels") && r.Method == http.MethodPost:
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/clients/"), "/tunnels")
+		s.handleAddTunnel(w, r, id)
+	case strings.HasPrefix(path, "/clients/") && strings.Contains(path, "/tunnels/") && r.Method == http.MethodDelete:
+		rest := strings.TrimPrefix(path, "/clients/")
+		parts := strings.SplitN(rest, "/tunnels/", 2)
+		if len(parts) == 2 {
+			s.handleRemoveTunnel(w, r, parts[0], parts[1])
+		} else {
+			http.NotFound(w, r)
+		}
 	default:
 		http.NotFound(w, r)
 	}
@@ -91,16 +105,17 @@ type sseClient struct {
 }
 
 type sseTunnel struct {
-	Name         string `json:"name"`
-	Type         string `json:"type"`
-	Endpoint     string `json:"endpoint"`
-	LocalAddr    string `json:"local_addr"`
-	BytesIn      int64  `json:"bytes_in"`
-	BytesOut     int64  `json:"bytes_out"`
-	BytesInHuman string `json:"bytes_in_human"`
+	ClientID      string `json:"client_id"`
+	Name          string `json:"name"`
+	Type          string `json:"type"`
+	Endpoint      string `json:"endpoint"`
+	LocalAddr     string `json:"local_addr"`
+	BytesIn       int64  `json:"bytes_in"`
+	BytesOut      int64  `json:"bytes_out"`
+	BytesInHuman  string `json:"bytes_in_human"`
 	BytesOutHuman string `json:"bytes_out_human"`
-	Requests     int64  `json:"requests"`
-	ActiveConns  int    `json:"active_conns"`
+	Requests      int64  `json:"requests"`
+	ActiveConns   int    `json:"active_conns"`
 }
 
 type sseTotals struct {
@@ -148,6 +163,7 @@ func (s *Server) buildSSEPayload() ssePayload {
 			}
 
 			tunnels = append(tunnels, sseTunnel{
+				ClientID:      snap.ID,
 				Name:          t.Name,
 				Type:          t.Type,
 				Endpoint:      endpoint,
@@ -177,6 +193,55 @@ func (s *Server) buildSSEPayload() ssePayload {
 		Clients:       clients,
 		Totals:        totals,
 	}
+}
+
+// handleAddTunnel relays an AddTunnel command to a connected client.
+func (s *Server) handleAddTunnel(w http.ResponseWriter, r *http.Request, clientID string) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 4096))
+	if err != nil {
+		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	var msg proto.AddTunnel
+	if err := json.Unmarshal(body, &msg); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if msg.Name == "" || msg.LocalAddr == "" || (msg.Type != "http" && msg.Type != "tcp") {
+		http.Error(w, "name, local_addr, and type (http|tcp) required", http.StatusBadRequest)
+		return
+	}
+
+	s.registry.mu.RLock()
+	entry, ok := s.registry.byID[clientID]
+	s.registry.mu.RUnlock()
+	if !ok {
+		http.Error(w, "client not found", http.StatusNotFound)
+		return
+	}
+	if err := entry.sendMsg(proto.TypeAddTunnel, msg); err != nil {
+		http.Error(w, "send to client: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	slog.Info("add tunnel relayed", "client", clientID, "tunnel", msg.Name)
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"ok":true}`)
+}
+
+// handleRemoveTunnel removes a tunnel from registry and notifies the client.
+func (s *Server) handleRemoveTunnel(w http.ResponseWriter, r *http.Request, clientID, tunnelName string) {
+	s.registry.mu.RLock()
+	entry, ok := s.registry.byID[clientID]
+	s.registry.mu.RUnlock()
+	if !ok {
+		http.Error(w, "client not found", http.StatusNotFound)
+		return
+	}
+	_ = entry.sendMsg(proto.TypeRemoveTunnel, proto.RemoveTunnel{Name: tunnelName})
+	s.registry.removeTunnelByName(clientID, tunnelName)
+	slog.Info("tunnel removed", "client", clientID, "tunnel", tunnelName)
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"ok":true}`)
 }
 
 // handleDisconnect forcibly closes a client session.
