@@ -84,9 +84,11 @@ func (s *Server) handlePromoteUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build with Nixpacks.
+	// Build with Nixpacks. Disable BuildKit to avoid requiring docker-buildx.
 	slog.Info("promote: nixpacks build", "name", name, "dir", dir)
-	buildOut, err := exec.Command("nixpacks", "build", dir, "--name", name).CombinedOutput()
+	nixCmd := exec.Command("nixpacks", "build", dir, "--name", name)
+	nixCmd.Env = append(os.Environ(), "DOCKER_BUILDKIT=0")
+	buildOut, err := nixCmd.CombinedOutput()
 	if err != nil {
 		os.RemoveAll(dir)
 		http.Error(w, fmt.Sprintf("nixpacks build failed:\n%s", buildOut), http.StatusInternalServerError)
