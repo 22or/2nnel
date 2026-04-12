@@ -172,6 +172,7 @@ func (h *controlHandler) registerHTTP(ctrl *proto.ControlConn, reg *proto.Regist
 		subdomain:  subdomain,
 		localAddr:  reg.LocalAddr,
 		hasDir:     reg.HasDir,
+		dir:        reg.Dir,
 	}
 	h.server.registry.registerHTTP(h.clientID, subdomain, te)
 

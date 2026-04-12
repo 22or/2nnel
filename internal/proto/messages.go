@@ -18,8 +18,9 @@ const (
 	TypeHeartbeat        = "heartbeat"
 	TypeAddTunnel        = "add_tunnel"
 	TypeRemoveTunnel     = "remove_tunnel"
-	TypePromote          = "promote"       // server→client: trigger promote upload
-	TypePromoteError     = "promote_error" // client→server: promote failed
+	TypePromote          = "promote"          // server→client: trigger promote upload
+	TypePromoteError     = "promote_error"    // client→server: promote failed
+	TypeSetTunnelDir     = "set_tunnel_dir"   // server→client: update project dir for a tunnel
 )
 
 // Envelope wraps all control-channel messages.
@@ -57,6 +58,7 @@ type RegisterTunnel struct {
 	RemotePort int    `json:"remote_port"` // for tcp tunnels
 	LocalAddr  string `json:"local_addr"`
 	HasDir     bool   `json:"has_dir"` // project dir configured; promote available
+	Dir        string `json:"dir"`     // client-side project directory path (for display)
 }
 
 // TunnelRegistered is sent by server when a tunnel is ready.
@@ -99,6 +101,12 @@ type Promote struct {
 type PromoteError struct {
 	TunnelName string `json:"tunnel_name"`
 	Error      string `json:"error"`
+}
+
+// SetTunnelDir is sent server→client to update the project directory for a tunnel.
+type SetTunnelDir struct {
+	TunnelName string `json:"tunnel_name"`
+	Dir        string `json:"dir"` // empty string clears the dir
 }
 
 // StreamHeader is the first thing written on every data stream by the server.

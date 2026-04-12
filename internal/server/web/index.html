@@ -159,6 +159,12 @@ function fmtBytes(n) {
   return n + ' B';
 }
 
+function dirBasename(p) {
+  if (!p) return '';
+  const parts = p.replace(/\\/g, '/').split('/').filter(Boolean);
+  return parts[parts.length - 1] || p;
+}
+
 function renderTunnel(t) {
   const dotCls = t.active_conns > 0 ? 'active-dot' : 'active-dot zero';
   const badge = t.type === 'http'
@@ -167,10 +173,18 @@ function renderTunnel(t) {
   const reqs = t.type === 'http'
     ? `<span class="metric-val">${t.requests}</span> <span class="bytes-label">req</span>`
     : '';
-  const promoteBtn = (t.can_promote && t.type === 'http')
-    ? `<button class="btn btn-outline-warning btn-remove-tunnel"
-         onclick="promoteTunnel('${escHtml(t.client_id)}','${escHtml(t.name)}',this)">Promote</button>`
-    : '';
+
+  const dirControls = t.type === 'http' ? (
+    t.can_promote
+      ? `<span class="local-addr" title="${escHtml(t.dir)}" style="cursor:default;">📁 ${escHtml(dirBasename(t.dir))}</span>
+         <button class="btn btn-outline-secondary btn-remove-tunnel"
+           onclick="setTunnelDir('${escHtml(t.client_id)}','${escHtml(t.name)}','${escHtml(t.dir||'')}')">Edit Dir</button>
+         <button class="btn btn-outline-warning btn-remove-tunnel"
+           onclick="promoteTunnel('${escHtml(t.client_id)}','${escHtml(t.name)}',this)">Promote</button>`
+      : `<button class="btn btn-outline-secondary btn-remove-tunnel"
+           onclick="setTunnelDir('${escHtml(t.client_id)}','${escHtml(t.name)}','')">Set Dir</button>`
+  ) : '';
+
   return `
     <div class="tunnel-row px-4 py-2 d-flex flex-wrap align-items-center gap-3">
       <span class="${dotCls}"></span>
@@ -185,7 +199,7 @@ function renderTunnel(t) {
         <span><span class="bytes-label">↑</span> <span class="metric-val">${t.bytes_out_human}</span></span>
         ${reqs}
         ${t.active_conns > 0 ? `<span class="badge bg-success">${t.active_conns} active</span>` : ''}
-        ${promoteBtn}
+        ${dirControls}
         <button class="btn btn-outline-secondary btn-remove-tunnel"
           onclick="removeTunnel('${escHtml(t.client_id)}','${escHtml(t.name)}')">Remove</button>
       </span>
@@ -274,6 +288,21 @@ function render(data) {
   } else {
     container.innerHTML = data.clients.map(renderClient).join('');
   }
+}
+
+async function setTunnelDir(clientId, tunnelName, currentDir) {
+  const dir = prompt(
+    'Project directory for "' + tunnelName + '" on this machine:\n(empty to clear)',
+    currentDir
+  );
+  if (dir === null) return;
+  try {
+    const r = await fetch(
+      '/_2nnel/clients/' + encodeURIComponent(clientId) + '/tunnels/' + encodeURIComponent(tunnelName) + '/dir' + authQ,
+      {method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({dir})}
+    );
+    if (!r.ok) alert('Error: ' + await r.text());
+  } catch(e) { alert('Error: ' + e); }
 }
 
 async function promoteTunnel(clientId, name, btn) {

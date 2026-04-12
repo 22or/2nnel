@@ -97,6 +97,7 @@ func (s *session) connect() error {
 			RemotePort: t.RemotePort,
 			LocalAddr:  t.Local,
 			HasDir:     t.Dir != "",
+			Dir:        t.Dir,
 		}
 		if err := ctrl.Send(proto.TypeRegisterTunnel, msg); err != nil {
 			_ = mux.Close()
@@ -174,6 +175,11 @@ func (s *session) controlLoop() {
 			if err := env.Unmarshal(&p); err == nil {
 				go s.handlePromote(p)
 			}
+		case proto.TypeSetTunnelDir:
+			var std proto.SetTunnelDir
+			if err := env.Unmarshal(&std); err == nil {
+				s.setTunnelDir(std)
+			}
 		case proto.TypeTunnelRegistered:
 			var tr proto.TunnelRegistered
 			_ = env.Unmarshal(&tr)
@@ -228,6 +234,23 @@ func (s *session) dynamicAdd(at proto.AddTunnel) {
 	})
 	cfg := s.cfg
 	s.cfgMu.Unlock()
+	if s.onSave != nil {
+		s.onSave(cfg)
+	}
+}
+
+// setTunnelDir updates the project directory for a tunnel (sent by server from dashboard).
+func (s *session) setTunnelDir(msg proto.SetTunnelDir) {
+	s.cfgMu.Lock()
+	for i, t := range s.cfg.Tunnels {
+		if t.Name == msg.TunnelName {
+			s.cfg.Tunnels[i].Dir = msg.Dir
+			break
+		}
+	}
+	cfg := s.cfg
+	s.cfgMu.Unlock()
+	slog.Info("tunnel dir updated", "tunnel", msg.TunnelName, "dir", msg.Dir)
 	if s.onSave != nil {
 		s.onSave(cfg)
 	}

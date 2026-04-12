@@ -42,6 +42,15 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/clients/") && strings.HasSuffix(path, "/tunnels") && r.Method == http.MethodPost:
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/clients/"), "/tunnels")
 		s.handleAddTunnel(w, r, id)
+	case strings.HasPrefix(path, "/clients/") && strings.Contains(path, "/tunnels/") && strings.HasSuffix(path, "/dir") && r.Method == http.MethodPatch:
+		rest := strings.TrimPrefix(path, "/clients/")
+		parts := strings.SplitN(rest, "/tunnels/", 2)
+		if len(parts) == 2 {
+			tunnelName := strings.TrimSuffix(parts[1], "/dir")
+			s.handleSetTunnelDir(w, r, parts[0], tunnelName)
+		} else {
+			http.NotFound(w, r)
+		}
 	case strings.HasPrefix(path, "/clients/") && strings.Contains(path, "/tunnels/") && strings.HasSuffix(path, "/promote") && r.Method == http.MethodPost:
 		rest := strings.TrimPrefix(path, "/clients/")
 		parts := strings.SplitN(rest, "/tunnels/", 2)
@@ -140,6 +149,7 @@ type sseTunnel struct {
 	Endpoint      string `json:"endpoint"`
 	LocalAddr     string `json:"local_addr"`
 	CanPromote    bool   `json:"can_promote"`
+	Dir           string `json:"dir"`
 	BytesIn       int64  `json:"bytes_in"`
 	BytesOut      int64  `json:"bytes_out"`
 	BytesInHuman  string `json:"bytes_in_human"`
@@ -199,6 +209,7 @@ func (s *Server) buildSSEPayload() ssePayload {
 				Endpoint:      endpoint,
 				LocalAddr:     t.LocalAddr,
 				CanPromote:    t.CanPromote,
+				Dir:           t.Dir,
 				BytesIn:       t.BytesIn,
 				BytesOut:      t.BytesOut,
 				BytesInHuman:  fmtBytes(t.BytesIn),
@@ -306,6 +317,59 @@ func (s *Server) handleDisconnect(w http.ResponseWriter, r *http.Request, client
 	slog.Info("admin disconnect", "client", clientID)
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, `{"ok":true,"disconnected":%q}`, clientID)
+}
+
+// handleSetTunnelDir updates the project directory for a tunnel and notifies the client.
+func (s *Server) handleSetTunnelDir(w http.ResponseWriter, r *http.Request, clientID, tunnelName string) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 4096))
+	if err != nil {
+		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	var req struct {
+		Dir string `json:"dir"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	s.registry.mu.RLock()
+	entry, ok := s.registry.byID[clientID]
+	s.registry.mu.RUnlock()
+	if !ok {
+		http.Error(w, "client not found", http.StatusNotFound)
+		return
+	}
+
+	entry.mu.Lock()
+	var found bool
+	for _, t := range entry.tunnels {
+		if t.name == tunnelName {
+			t.dir = req.Dir
+			t.hasDir = req.Dir != ""
+			found = true
+			break
+		}
+	}
+	entry.mu.Unlock()
+
+	if !found {
+		http.Error(w, "tunnel not found", http.StatusNotFound)
+		return
+	}
+
+	if err := entry.sendMsg(proto.TypeSetTunnelDir, proto.SetTunnelDir{
+		TunnelName: tunnelName,
+		Dir:        req.Dir,
+	}); err != nil {
+		http.Error(w, "send to client: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	slog.Info("tunnel dir updated", "client", clientID, "tunnel", tunnelName, "dir", req.Dir)
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"ok":true}`)
 }
 
 // handlePromoteTrigger sends a TypePromote message to the client, which then
