@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/22or/2nnel/internal/proto"
 )
 
 // deployedApp represents a project promoted to and running on the server via Docker.
@@ -54,10 +56,6 @@ func (s *Server) handlePromoteUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.registry.isSubdomainTaken(name) {
-		http.Error(w, fmt.Sprintf("subdomain %q already in use by a tunnel client", name), http.StatusConflict)
-		return
-	}
 	if _, exists := s.deployedApps.Load(name); exists {
 		http.Error(w, fmt.Sprintf("app %q already deployed — stop it first", name), http.StatusConflict)
 		return
@@ -132,7 +130,18 @@ func (s *Server) handlePromoteUpload(w http.ResponseWriter, r *http.Request) {
 		dir:         dir,
 		startedAt:   time.Now(),
 	}
+	// Store deployed app first so traffic routes to Docker immediately.
 	s.deployedApps.Store(name, app)
+
+	// Evict the client tunnel using this subdomain (if any) — it handed off to Docker.
+	s.registry.mu.RLock()
+	evictEntry := s.registry.bySubdomain[name]
+	s.registry.mu.RUnlock()
+	if evictEntry != nil {
+		_ = evictEntry.sendMsg(proto.TypeRemoveTunnel, proto.RemoveTunnel{Name: name})
+		s.registry.removeTunnelByName(evictEntry.id, name)
+		slog.Info("tunnel evicted after promote", "name", name, "client", evictEntry.id)
+	}
 
 	publicURL := s.buildPublicHTTPURL(name)
 	slog.Info("app promoted", "name", name, "url", publicURL, "container", containerID)
