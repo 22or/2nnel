@@ -171,6 +171,11 @@ func (s *Server) handlePromoteUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	args = append(args, name)
 
+	// Snapshot ports already listening on the host BEFORE the container starts.
+	// With --network host the container shares host network, so we detect the app's
+	// port by looking for a new port that wasn't there before docker run.
+	knownPorts := snapshotListeningPorts()
+
 	build.appendLine("Starting container…")
 	slog.Info("promote: docker run", "name", name)
 	out, err := exec.Command("docker", args...).Output()
@@ -182,10 +187,8 @@ func (s *Server) handlePromoteUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	containerID := strings.TrimSpace(string(out))
 
-	// Detect the actual port the app is listening on. Poll ss inside the container
-	// so we catch the real port regardless of PORT env, framework defaults, or
-	// custom config. Timeout after 60 s to handle slow startup (npm, Python, etc.).
-	port, err := detectContainerPort(containerID, 60*time.Second)
+	// Poll the host's listening ports until a new one appears (the app's port).
+	port, err := detectContainerPort(knownPorts, 60*time.Second)
 	if err != nil {
 		build.finish("container started but app never listened: " + err.Error())
 		exec.Command("docker", "stop", containerID).Run()
@@ -354,16 +357,34 @@ func extractTarball(r io.Reader, dir string) error {
 	return nil
 }
 
-// detectContainerPort polls ss inside the running container until it finds a
-// user-space TCP port (>1024) the app is listening on. Works regardless of
-// whether the app respects PORT, uses a framework default, or reads custom config.
-func detectContainerPort(containerID string, timeout time.Duration) (int, error) {
+// snapshotListeningPorts returns the set of TCP ports currently listening on
+// the host. Used to establish a baseline before docker run so we can detect
+// the app's port by diffing before/after (--network host shares host netns).
+func snapshotListeningPorts() map[int]bool {
+	ports := map[int]bool{}
+	out, err := exec.Command("ss", "-Htln").Output()
+	if err != nil {
+		return ports
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if p := parseSSPort(line); p > 1024 {
+			ports[p] = true
+		}
+	}
+	return ports
+}
+
+// detectContainerPort polls the host's listening ports until a new one appears
+// that wasn't in knownPorts (i.e. the app's port). Works for any port the app
+// chooses regardless of PORT env var, framework defaults, or custom config.
+func detectContainerPort(knownPorts map[int]bool, timeout time.Duration) (int, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		out, err := exec.Command("docker", "exec", containerID, "ss", "-Htlnp").Output()
-		if err == nil {
-			if port := parseFirstUserPort(out); port > 0 {
-				return port, nil
+		out, _ := exec.Command("ss", "-Htln").Output()
+		for _, line := range strings.Split(string(out), "\n") {
+			p := parseSSPort(line)
+			if p > 1024 && !knownPorts[p] {
+				return p, nil
 			}
 		}
 		time.Sleep(2 * time.Second)
@@ -371,27 +392,23 @@ func detectContainerPort(containerID string, timeout time.Duration) (int, error)
 	return 0, fmt.Errorf("app did not start listening within %s", timeout)
 }
 
-// parseFirstUserPort parses ss -Htlnp output and returns the first listening
-// port above 1024 (skipping privileged and well-known system ports).
-func parseFirstUserPort(ssOut []byte) int {
-	for _, line := range strings.Split(string(ssOut), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 5 {
-			continue
-		}
-		// Local address is fields[3]: "0.0.0.0:4200", ":::3000", "*:8080"
-		addr := fields[3]
-		i := strings.LastIndex(addr, ":")
-		if i < 0 {
-			continue
-		}
-		p, err := strconv.Atoi(addr[i+1:])
-		if err != nil || p <= 1024 {
-			continue
-		}
-		return p
+// parseSSPort extracts the port number from one line of `ss -Htln` output.
+// Local address field format: "0.0.0.0:4200", ":::3000", "*:8080".
+func parseSSPort(line string) int {
+	fields := strings.Fields(line)
+	if len(fields) < 4 {
+		return 0
 	}
-	return 0
+	addr := fields[3]
+	i := strings.LastIndex(addr, ":")
+	if i < 0 {
+		return 0
+	}
+	p, err := strconv.Atoi(addr[i+1:])
+	if err != nil {
+		return 0
+	}
+	return p
 }
 
 // isValidDeployName returns true if name is alphanumeric+hyphen and ≤40 chars.
