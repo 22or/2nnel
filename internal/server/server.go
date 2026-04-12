@@ -216,6 +216,7 @@ type tunnelEntry struct {
 	subdomain  string
 	remotePort int
 	localAddr  string
+	hasDir     bool         // client has a project dir configured; promote available
 	tcpLn      net.Listener // non-nil for TCP tunnels
 
 	// metrics — all atomic for lock-free reads by dashboard
@@ -378,6 +379,7 @@ func (reg *Registry) snapshot() []clientSnapshot {
 				Type:        t.tunnelType,
 				Endpoint:    endpoint,
 				LocalAddr:   t.localAddr,
+				CanPromote:  t.hasDir,
 				BytesIn:     t.bytesIn.Load(),
 				BytesOut:    t.bytesOut.Load(),
 				Requests:    t.requests.Load(),
@@ -407,6 +409,7 @@ type tunnelSnapshot struct {
 	Type        string
 	Endpoint    string
 	LocalAddr   string
+	CanPromote  bool
 	BytesIn     int64
 	BytesOut    int64
 	Requests    int64

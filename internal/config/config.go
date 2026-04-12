@@ -30,4 +30,5 @@ type TunnelConfig struct {
 	Type       string `mapstructure:"type"        yaml:"type"`        // "http" or "tcp"
 	Subdomain  string `mapstructure:"subdomain"   yaml:"subdomain"`   // HTTP tunnels
 	RemotePort int    `mapstructure:"remote_port" yaml:"remote_port"` // TCP tunnels
+	Dir        string `mapstructure:"dir"         yaml:"dir,omitempty"` // project root for promote
 }

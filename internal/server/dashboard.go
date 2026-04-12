@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -27,13 +28,13 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		s.handleMetrics(w, r)
 	case path == "/stream":
 		s.handleSSE(w, r)
-	case path == "/deploy" && r.Method == http.MethodPost:
-		s.handleDeploy(w, r)
-	case strings.HasPrefix(path, "/deploy/") && strings.HasSuffix(path, "/logs") && r.Method == http.MethodGet:
-		name := strings.TrimSuffix(strings.TrimPrefix(path, "/deploy/"), "/logs")
+	case path == "/promote" && r.Method == http.MethodPost:
+		s.handlePromoteUpload(w, r)
+	case strings.HasPrefix(path, "/promote/") && strings.HasSuffix(path, "/logs") && r.Method == http.MethodGet:
+		name := strings.TrimSuffix(strings.TrimPrefix(path, "/promote/"), "/logs")
 		s.handleDeployLogs(w, r, name)
-	case strings.HasPrefix(path, "/deploy/") && r.Method == http.MethodDelete:
-		name := strings.TrimPrefix(path, "/deploy/")
+	case strings.HasPrefix(path, "/promote/") && r.Method == http.MethodDelete:
+		name := strings.TrimPrefix(path, "/promote/")
 		s.handleDeleteDeploy(w, r, name)
 	case strings.HasPrefix(path, "/clients/") && strings.HasSuffix(path, "/disconnect") && r.Method == http.MethodPost:
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/clients/"), "/disconnect")
@@ -41,6 +42,15 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/clients/") && strings.HasSuffix(path, "/tunnels") && r.Method == http.MethodPost:
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/clients/"), "/tunnels")
 		s.handleAddTunnel(w, r, id)
+	case strings.HasPrefix(path, "/clients/") && strings.Contains(path, "/tunnels/") && strings.HasSuffix(path, "/promote") && r.Method == http.MethodPost:
+		rest := strings.TrimPrefix(path, "/clients/")
+		parts := strings.SplitN(rest, "/tunnels/", 2)
+		if len(parts) == 2 {
+			tunnelName := strings.TrimSuffix(parts[1], "/promote")
+			s.handlePromoteTrigger(w, r, parts[0], tunnelName)
+		} else {
+			http.NotFound(w, r)
+		}
 	case strings.HasPrefix(path, "/clients/") && strings.Contains(path, "/tunnels/") && r.Method == http.MethodDelete:
 		rest := strings.TrimPrefix(path, "/clients/")
 		parts := strings.SplitN(rest, "/tunnels/", 2)
@@ -108,8 +118,7 @@ type sseDeployedApp struct {
 	Name        string   `json:"name"`
 	PublicURL   string   `json:"public_url"`
 	Port        int      `json:"port"`
-	Restarts    int      `json:"restarts"`
-	LastStart   string   `json:"last_start"`
+	StartedAt   string   `json:"started_at"`
 	Requests    int64    `json:"requests"`
 	ActiveConns int      `json:"active_conns"`
 	RecentLogs  []string `json:"recent_logs"`
@@ -130,6 +139,7 @@ type sseTunnel struct {
 	Type          string `json:"type"`
 	Endpoint      string `json:"endpoint"`
 	LocalAddr     string `json:"local_addr"`
+	CanPromote    bool   `json:"can_promote"`
 	BytesIn       int64  `json:"bytes_in"`
 	BytesOut      int64  `json:"bytes_out"`
 	BytesInHuman  string `json:"bytes_in_human"`
@@ -188,6 +198,7 @@ func (s *Server) buildSSEPayload() ssePayload {
 				Type:          t.Type,
 				Endpoint:      endpoint,
 				LocalAddr:     t.LocalAddr,
+				CanPromote:    t.CanPromote,
 				BytesIn:       t.BytesIn,
 				BytesOut:      t.BytesOut,
 				BytesInHuman:  fmtBytes(t.BytesIn),
@@ -211,30 +222,16 @@ func (s *Server) buildSSEPayload() ssePayload {
 	var deployedApps []sseDeployedApp
 	s.deployedApps.Range(func(k, v any) bool {
 		app := v.(*deployedApp)
-		app.mu.Lock()
-		port := app.port
-		restarts := app.restarts
-		lastStart := app.lastStart
-		app.mu.Unlock()
-
-		app.logMu.Lock()
-		var recentLogs []string
-		if n := len(app.logBuf); n > 0 {
-			start := n - 10
-			if start < 0 {
-				start = 0
-			}
-			recentLogs = make([]string, n-start)
-			copy(recentLogs, app.logBuf[start:])
+		out, _ := exec.Command("docker", "logs", "--tail", "10", "2nnel-"+app.name).CombinedOutput()
+		recentLogs := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+		if len(recentLogs) == 1 && recentLogs[0] == "" {
+			recentLogs = nil
 		}
-		app.logMu.Unlock()
-
 		deployedApps = append(deployedApps, sseDeployedApp{
 			Name:        app.name,
 			PublicURL:   s.buildPublicHTTPURL(app.subdomain),
-			Port:        port,
-			Restarts:    restarts,
-			LastStart:   lastStart.UTC().Format(time.RFC3339),
+			Port:        app.port,
+			StartedAt:   app.startedAt.UTC().Format(time.RFC3339),
 			Requests:    app.requests.Load(),
 			ActiveConns: int(app.activeConns.Load()),
 			RecentLogs:  recentLogs,
@@ -309,6 +306,25 @@ func (s *Server) handleDisconnect(w http.ResponseWriter, r *http.Request, client
 	slog.Info("admin disconnect", "client", clientID)
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, `{"ok":true,"disconnected":%q}`, clientID)
+}
+
+// handlePromoteTrigger sends a TypePromote message to the client, which then
+// tarballs its project dir and POSTs it to /_2nnel/promote.
+func (s *Server) handlePromoteTrigger(w http.ResponseWriter, r *http.Request, clientID, tunnelName string) {
+	s.registry.mu.RLock()
+	entry, ok := s.registry.byID[clientID]
+	s.registry.mu.RUnlock()
+	if !ok {
+		http.Error(w, "client not found", http.StatusNotFound)
+		return
+	}
+	if err := entry.sendMsg(proto.TypePromote, proto.Promote{TunnelName: tunnelName}); err != nil {
+		http.Error(w, "send to client: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	slog.Info("promote triggered", "client", clientID, "tunnel", tunnelName)
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"ok":true}`)
 }
 
 // fmtDuration formats a duration for human display (e.g. "3m 24s").

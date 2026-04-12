@@ -24,6 +24,7 @@ func init() {
 	clientCmd.Flags().StringArray("tunnel", nil, "Tunnel spec: name:local_addr[:tcp:remote_port]")
 	clientCmd.Flags().String("auth-token", "", "Auth token for server")
 	clientCmd.Flags().StringP("config", "c", "", "Config file path (YAML)")
+	clientCmd.Flags().String("dir", "", "Project directory for promote (single-tunnel mode only)")
 }
 
 func runClient(cmd *cobra.Command, args []string) error {
@@ -52,9 +53,15 @@ func runClient(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("--server is required")
 		}
 
+		dirFlag, _ := cmd.Flags().GetString("dir")
+
 		tunnels, err := parseTunnelSpecs(tunnelSpecs)
 		if err != nil {
 			return err
+		}
+
+		if dirFlag != "" && len(tunnels) == 1 {
+			tunnels[0].Dir = dirFlag
 		}
 
 		cfg = &config.ClientConfig{

@@ -1,12 +1,12 @@
 package server
 
 import (
-	"bufio"
+	"archive/tar"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -14,41 +14,32 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sync"
+	"strings"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
-// deployedApp represents a binary deployed to and running on the server.
+// deployedApp represents a project promoted to and running on the server via Docker.
 type deployedApp struct {
-	name       string
-	subdomain  string
-	binaryPath string
-	dir        string
-	env        []string
-
-	mu        sync.Mutex
-	cmd       *exec.Cmd
-	port      int
-	restarts  int
-	lastStart time.Time
-	stopped   bool
+	name        string
+	subdomain   string
+	containerID string
+	port        int
+	dir         string // extracted project dir on server
+	startedAt   time.Time
 
 	requests    atomic.Int64
 	activeConns atomic.Int32
-
-	logMu  sync.Mutex
-	logBuf []string // ring buffer, cap 200
 }
 
-// handleDeploy handles POST /_2nnel/deploy — receives a binary, saves it, and runs it.
-func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
+// handlePromoteUpload handles POST /_2nnel/promote — receives a tarball, builds with
+// Nixpacks, and runs the resulting Docker image permanently.
+func (s *Server) handlePromoteUpload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if err := r.ParseMultipartForm(100 << 20); err != nil {
+	if err := r.ParseMultipartForm(500 << 20); err != nil {
 		http.Error(w, "parse form: "+err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -72,137 +63,85 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	file, _, err := r.FormFile("binary")
+	tarFile, _, err := r.FormFile("tarball")
 	if err != nil {
-		http.Error(w, "binary file required: "+err.Error(), http.StatusBadRequest)
+		http.Error(w, "tarball file required: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	defer file.Close()
+	defer tarFile.Close()
 
 	baseDir := s.cfg.DeployDir
 	if baseDir == "" {
 		baseDir = os.TempDir()
 	}
-	dir, err := os.MkdirTemp(baseDir, "2nnel-deploy-*")
+	dir, err := os.MkdirTemp(baseDir, "2nnel-promote-*")
 	if err != nil {
 		http.Error(w, "create temp dir: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	binaryPath := filepath.Join(dir, name)
-	f, err := os.OpenFile(binaryPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	if err := extractTarball(tarFile, dir); err != nil {
+		os.RemoveAll(dir)
+		http.Error(w, "extract tarball: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Build with Nixpacks.
+	slog.Info("promote: nixpacks build", "name", name, "dir", dir)
+	buildOut, err := exec.Command("nixpacks", "build", dir, "--name", name).CombinedOutput()
 	if err != nil {
 		os.RemoveAll(dir)
-		http.Error(w, "create binary: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("nixpacks build failed:\n%s", buildOut), http.StatusInternalServerError)
 		return
 	}
-	if _, err := io.Copy(f, file); err != nil {
-		f.Close()
-		os.RemoveAll(dir)
-		http.Error(w, "write binary: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	f.Close()
 
-	var envVars []string
-	if r.MultipartForm != nil {
-		envVars = r.MultipartForm.Value["env"]
+	port, err := pickFreePort()
+	if err != nil {
+		os.RemoveAll(dir)
+		http.Error(w, "pick port: "+err.Error(), http.StatusInternalServerError)
+		return
 	}
+
+	// Build docker run args.
+	args := []string{
+		"run", "-d", "--restart=unless-stopped",
+		"--name", "2nnel-" + name,
+		"-e", fmt.Sprintf("PORT=%d", port),
+		"-p", fmt.Sprintf("127.0.0.1:%d:%d", port, port),
+	}
+	envFile := filepath.Join(dir, ".env")
+	if _, statErr := os.Stat(envFile); statErr == nil {
+		args = append(args, "--env-file", envFile)
+	}
+	args = append(args, name)
+
+	slog.Info("promote: docker run", "name", name, "port", port)
+	out, err := exec.Command("docker", args...).Output()
+	if err != nil {
+		os.RemoveAll(dir)
+		http.Error(w, fmt.Sprintf("docker run failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	containerID := strings.TrimSpace(string(out))
 
 	app := &deployedApp{
-		name:       name,
-		subdomain:  name,
-		binaryPath: binaryPath,
-		dir:        dir,
-		env:        envVars,
+		name:        name,
+		subdomain:   name,
+		containerID: containerID,
+		port:        port,
+		dir:         dir,
+		startedAt:   time.Now(),
 	}
-
-	if err := s.startApp(app); err != nil {
-		os.RemoveAll(dir)
-		http.Error(w, "start app: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
 	s.deployedApps.Store(name, app)
 
 	publicURL := s.buildPublicHTTPURL(name)
-	slog.Info("app deployed", "name", name, "url", publicURL)
+	slog.Info("app promoted", "name", name, "url", publicURL, "container", containerID)
 
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"ok":true,"name":%q,"url":%q}`, name, publicURL)
+	fmt.Fprintf(w, `{"ok":true,"url":%q}`, publicURL)
 }
 
-// startApp launches the binary, setting up log capture and supervision.
-func (s *Server) startApp(app *deployedApp) error {
-	port, err := pickFreePort()
-	if err != nil {
-		return fmt.Errorf("pick port: %w", err)
-	}
-
-	cmd := exec.Command(app.binaryPath)
-	cmd.Dir = app.dir
-	cmd.Env = append(os.Environ(), fmt.Sprintf("PORT=%d", port))
-	cmd.Env = append(cmd.Env, app.env...)
-
-	pr, pw := io.Pipe()
-	cmd.Stdout = pw
-	cmd.Stderr = pw
-
-	if err := cmd.Start(); err != nil {
-		pr.Close()
-		pw.Close()
-		return fmt.Errorf("exec: %w", err)
-	}
-
-	app.mu.Lock()
-	app.cmd = cmd
-	app.port = port
-	app.lastStart = time.Now()
-	app.mu.Unlock()
-
-	go app.readLogs(pr)
-	go s.supervise(app, cmd, pw)
-
-	slog.Info("deployed app started", "name", app.name, "port", port, "pid", cmd.Process.Pid)
-	return nil
-}
-
-// supervise watches the process and restarts it with exponential backoff on exit.
-func (s *Server) supervise(app *deployedApp, cmd *exec.Cmd, pw *io.PipeWriter) {
-	err := cmd.Wait()
-	pw.Close()
-
-	app.mu.Lock()
-	stopped := app.stopped
-	restarts := app.restarts
-	app.mu.Unlock()
-
-	if stopped {
-		return
-	}
-
-	slog.Warn("deployed app exited, restarting", "name", app.name, "err", err, "restarts", restarts)
-
-	delay := time.Duration(math.Min(
-		float64(time.Second)*math.Pow(2, float64(min(restarts, 6))),
-		float64(60*time.Second),
-	))
-	time.Sleep(delay)
-
-	app.mu.Lock()
-	if app.stopped {
-		app.mu.Unlock()
-		return
-	}
-	app.restarts++
-	app.mu.Unlock()
-
-	if err := s.startApp(app); err != nil {
-		slog.Error("restart failed", "name", app.name, "err", err)
-	}
-}
-
-// stopApp kills a deployed app and removes its files.
+// stopApp stops and removes a deployed app's container, image, and files.
 func (s *Server) stopApp(name string) bool {
 	val, ok := s.deployedApps.Load(name)
 	if !ok {
@@ -210,46 +149,52 @@ func (s *Server) stopApp(name string) bool {
 	}
 	app := val.(*deployedApp)
 
-	app.mu.Lock()
-	app.stopped = true
-	cmd := app.cmd
-	dir := app.dir
-	app.mu.Unlock()
-
-	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Signal(syscall.SIGTERM)
-		time.Sleep(2 * time.Second)
-		_ = cmd.Process.Kill()
-	}
-	os.RemoveAll(dir)
+	exec.Command("docker", "stop", "2nnel-"+app.name).Run()
+	exec.Command("docker", "rm", "2nnel-"+app.name).Run()
+	exec.Command("docker", "rmi", app.name).Run()
+	os.RemoveAll(app.dir)
 	s.deployedApps.Delete(name)
 	slog.Info("deployed app stopped", "name", name)
 	return true
 }
 
-// stopAllDeployedApps signals all deployed apps on server shutdown.
+// stopAllDeployedApps stops all running containers on server shutdown.
 func (s *Server) stopAllDeployedApps() {
 	s.deployedApps.Range(func(k, v any) bool {
 		app := v.(*deployedApp)
-		app.mu.Lock()
-		app.stopped = true
-		cmd := app.cmd
-		app.mu.Unlock()
-		if cmd != nil && cmd.Process != nil {
-			_ = cmd.Process.Signal(syscall.SIGTERM)
-			_ = cmd.Process.Kill()
-		}
+		exec.Command("docker", "stop", "2nnel-"+app.name).Run()
 		return true
 	})
 }
 
+// handleDeleteDeploy handles DELETE /_2nnel/promote/<name>.
+func (s *Server) handleDeleteDeploy(w http.ResponseWriter, r *http.Request, name string) {
+	if !s.stopApp(name) {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"ok":true}`)
+}
+
+// handleDeployLogs handles GET /_2nnel/promote/<name>/logs — returns last 50 log lines.
+func (s *Server) handleDeployLogs(w http.ResponseWriter, r *http.Request, name string) {
+	val, ok := s.deployedApps.Load(name)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	app := val.(*deployedApp)
+	out, _ := exec.Command("docker", "logs", "--tail", "50", "2nnel-"+app.name).CombinedOutput()
+	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+	w.Header().Set("Content-Type", "application/json")
+	b, _ := json.Marshal(lines)
+	_, _ = w.Write(b)
+}
+
 // serveDeployedApp reverse-proxies an HTTP request to a deployed app's local port.
 func (s *Server) serveDeployedApp(w http.ResponseWriter, r *http.Request, app *deployedApp) {
-	app.mu.Lock()
-	port := app.port
-	app.mu.Unlock()
-
-	if port == 0 {
+	if app.port == 0 {
 		http.Error(w, "app not ready", http.StatusServiceUnavailable)
 		return
 	}
@@ -260,7 +205,7 @@ func (s *Server) serveDeployedApp(w http.ResponseWriter, r *http.Request, app *d
 
 	target := &url.URL{
 		Scheme: "http",
-		Host:   fmt.Sprintf("127.0.0.1:%d", port),
+		Host:   fmt.Sprintf("127.0.0.1:%d", app.port),
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
@@ -270,46 +215,58 @@ func (s *Server) serveDeployedApp(w http.ResponseWriter, r *http.Request, app *d
 	proxy.ServeHTTP(w, r)
 }
 
-// handleDeleteDeploy handles DELETE /_2nnel/deploy/<name>.
-func (s *Server) handleDeleteDeploy(w http.ResponseWriter, r *http.Request, name string) {
-	if !s.stopApp(name) {
-		http.NotFound(w, r)
-		return
+// extractTarball extracts a gzipped tar archive into dir.
+func extractTarball(r io.Reader, dir string) error {
+	gr, err := gzip.NewReader(r)
+	if err != nil {
+		return fmt.Errorf("gzip: %w", err)
 	}
-	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"ok":true}`)
-}
+	defer gr.Close()
 
-// handleDeployLogs handles GET /_2nnel/deploy/<name>/logs — returns last 200 log lines.
-func (s *Server) handleDeployLogs(w http.ResponseWriter, r *http.Request, name string) {
-	val, ok := s.deployedApps.Load(name)
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	app := val.(*deployedApp)
-	app.logMu.Lock()
-	logs := make([]string, len(app.logBuf))
-	copy(logs, app.logBuf)
-	app.logMu.Unlock()
+	tr := tar.NewReader(gr)
+	cleanDir := filepath.Clean(dir) + string(os.PathSeparator)
 
-	w.Header().Set("Content-Type", "application/json")
-	b, _ := json.Marshal(logs)
-	_, _ = w.Write(b)
-}
-
-// readLogs feeds process stdout/stderr into the ring buffer.
-func (app *deployedApp) readLogs(r io.Reader) {
-	scanner := bufio.NewScanner(r)
-	for scanner.Scan() {
-		line := scanner.Text()
-		app.logMu.Lock()
-		if len(app.logBuf) >= 200 {
-			app.logBuf = app.logBuf[1:]
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
 		}
-		app.logBuf = append(app.logBuf, line)
-		app.logMu.Unlock()
+		if err != nil {
+			return fmt.Errorf("tar: %w", err)
+		}
+
+		// Sanitize path — prevent traversal.
+		clean := filepath.Clean(hdr.Name)
+		if filepath.IsAbs(clean) || strings.HasPrefix(clean, "..") {
+			continue
+		}
+
+		target := filepath.Join(dir, clean)
+		if !strings.HasPrefix(target, cleanDir) {
+			continue
+		}
+
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0755); err != nil {
+				return fmt.Errorf("mkdir %s: %w", target, err)
+			}
+		default: // treat everything else as a regular file
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				return fmt.Errorf("mkdir parent: %w", err)
+			}
+			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, hdr.FileInfo().Mode())
+			if err != nil {
+				return fmt.Errorf("create %s: %w", target, err)
+			}
+			if _, err := io.Copy(f, tr); err != nil {
+				f.Close()
+				return fmt.Errorf("write %s: %w", target, err)
+			}
+			f.Close()
+		}
 	}
+	return nil
 }
 
 // pickFreePort finds a free localhost TCP port by binding to :0.

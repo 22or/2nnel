@@ -51,7 +51,6 @@
   </span>
   <div class="d-flex align-items-center gap-3">
     <span id="uptime-badge" class="uptime-badge">uptime: —</span>
-    <button class="btn btn-warning btn-sm text-dark fw-bold" onclick="openDeployModal()">+ Deploy</button>
     <span>
       <span id="status-dot" class="disconnected"></span>
       <span id="status-text" style="font-size:0.8rem; color:#8b949e;">connecting…</span>
@@ -103,44 +102,6 @@
     </div>
   </div>
 
-</div>
-
-<!-- Deploy Modal -->
-<div class="modal fade" id="deployModal" tabindex="-1">
-  <div class="modal-dialog">
-    <div class="modal-content modal-dark text-light">
-      <div class="modal-header">
-        <h5 class="modal-title">Deploy Binary</h5>
-        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
-      </div>
-      <div class="modal-body">
-        <div class="mb-3">
-          <label class="form-label text-secondary small">App Name <span class="text-secondary">(becomes subdomain)</span></label>
-          <input id="d-name" type="text" class="form-control form-control-dark" placeholder="myapp">
-        </div>
-        <div class="mb-3">
-          <label class="form-label text-secondary small">Binary</label>
-          <input id="d-file" type="file" class="form-control form-control-dark">
-          <div class="form-text text-secondary" style="font-size:0.75rem;">Must be a statically-linked executable for this server's OS/arch.</div>
-        </div>
-        <div class="mb-3">
-          <label class="form-label text-secondary small">Env Vars <span class="text-secondary">(one KEY=VALUE per line, optional)</span></label>
-          <textarea id="d-env" class="form-control form-control-dark" rows="3" placeholder="DATABASE_URL=postgres://...&#10;SECRET=abc123"></textarea>
-        </div>
-        <div id="deploy-progress" class="d-none">
-          <div class="progress mb-2" style="height:4px;">
-            <div class="progress-bar progress-bar-striped progress-bar-animated w-100"></div>
-          </div>
-          <div class="text-secondary small">Uploading…</div>
-        </div>
-        <div id="deploy-error" class="text-danger small d-none"></div>
-      </div>
-      <div class="modal-footer">
-        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-        <button type="button" class="btn btn-warning text-dark fw-bold" id="deploy-btn" onclick="submitDeploy()">Deploy</button>
-      </div>
-    </div>
-  </div>
 </div>
 
 <!-- Add Tunnel Modal -->
@@ -206,6 +167,10 @@ function renderTunnel(t) {
   const reqs = t.type === 'http'
     ? `<span class="metric-val">${t.requests}</span> <span class="bytes-label">req</span>`
     : '';
+  const promoteBtn = (t.can_promote && t.type === 'http')
+    ? `<button class="btn btn-outline-warning btn-remove-tunnel"
+         onclick="promoteTunnel('${escHtml(t.client_id)}','${escHtml(t.name)}',this)">Promote</button>`
+    : '';
   return `
     <div class="tunnel-row px-4 py-2 d-flex flex-wrap align-items-center gap-3">
       <span class="${dotCls}"></span>
@@ -220,6 +185,7 @@ function renderTunnel(t) {
         <span><span class="bytes-label">↑</span> <span class="metric-val">${t.bytes_out_human}</span></span>
         ${reqs}
         ${t.active_conns > 0 ? `<span class="badge bg-success">${t.active_conns} active</span>` : ''}
+        ${promoteBtn}
         <button class="btn btn-outline-secondary btn-remove-tunnel"
           onclick="removeTunnel('${escHtml(t.client_id)}','${escHtml(t.name)}')">Remove</button>
       </span>
@@ -263,10 +229,10 @@ function renderDeployedApp(app) {
   return `
     <div class="client-card mb-3">
       <div class="client-header px-4 py-2 d-flex align-items-center gap-3 flex-wrap">
-        <span class="badge bg-warning text-dark">DEPLOY</span>
+        <span class="badge bg-success">DEPLOYED</span>
         <span class="font-monospace fw-bold" style="color:#e6edf3;">${escHtml(app.name)}</span>
         <a class="endpoint" href="${escHtml(app.public_url)}" target="_blank" rel="noopener">${escHtml(app.public_url)}</a>
-        <span class="text-secondary" style="font-size:0.8rem;">port ${app.port} · ${app.requests} req · ${app.restarts} restart(s)</span>
+        <span class="text-secondary" style="font-size:0.8rem;">port ${app.port} · ${app.requests} req</span>
         <span class="ms-auto">
           <button class="btn btn-outline-danger btn-disconnect"
             onclick="stopDeploy('${escHtml(app.name)}')">Stop</button>
@@ -310,10 +276,33 @@ function render(data) {
   }
 }
 
-async function stopDeploy(name) {
-  if (!confirm('Stop deployed app "' + name + '"? This will kill the process and remove its files.')) return;
+async function promoteTunnel(clientId, name, btn) {
+  if (!confirm('Promote "' + name + '" to a permanent deployed app?\n\nThe server will build and run it with Docker + Nixpacks.\nThis may take a few minutes.')) return;
+  btn.disabled = true;
+  btn.textContent = 'Building…';
   try {
-    const r = await fetch('/_2nnel/deploy/' + encodeURIComponent(name) + authQ, {method:'DELETE'});
+    const r = await fetch(
+      '/_2nnel/clients/' + encodeURIComponent(clientId) + '/tunnels/' + encodeURIComponent(name) + '/promote' + authQ,
+      {method: 'POST'}
+    );
+    if (!r.ok) {
+      alert('Error: ' + await r.text());
+      btn.disabled = false;
+      btn.textContent = 'Promote';
+    } else {
+      btn.textContent = 'Building… (watch deployed section)';
+    }
+  } catch(e) {
+    alert('Error: ' + e);
+    btn.disabled = false;
+    btn.textContent = 'Promote';
+  }
+}
+
+async function stopDeploy(name) {
+  if (!confirm('Stop deployed app "' + name + '"? This will stop the container and remove its files.')) return;
+  try {
+    const r = await fetch('/_2nnel/promote/' + encodeURIComponent(name) + authQ, {method:'DELETE'});
     if (!r.ok) alert('Error: ' + await r.text());
   } catch(e) { alert('Error: ' + e); }
 }
@@ -388,54 +377,6 @@ async function submitAddTunnel() {
   } catch(e) {
     errEl.textContent = String(e);
     errEl.classList.remove('d-none');
-  }
-}
-
-let deployModal;
-function openDeployModal() {
-  document.getElementById('d-name').value = '';
-  document.getElementById('d-file').value = '';
-  document.getElementById('d-env').value = '';
-  document.getElementById('deploy-error').classList.add('d-none');
-  document.getElementById('deploy-progress').classList.add('d-none');
-  document.getElementById('deploy-btn').disabled = false;
-  if (!deployModal) deployModal = new bootstrap.Modal(document.getElementById('deployModal'));
-  deployModal.show();
-}
-
-async function submitDeploy() {
-  const name    = document.getElementById('d-name').value.trim();
-  const fileEl  = document.getElementById('d-file');
-  const envText = document.getElementById('d-env').value.trim();
-  const errEl   = document.getElementById('deploy-error');
-  const prog    = document.getElementById('deploy-progress');
-  const btn     = document.getElementById('deploy-btn');
-
-  errEl.classList.add('d-none');
-  if (!name) { errEl.textContent = 'App name required.'; errEl.classList.remove('d-none'); return; }
-  if (!fileEl.files.length) { errEl.textContent = 'Select a binary file.'; errEl.classList.remove('d-none'); return; }
-
-  const fd = new FormData();
-  fd.append('name', name);
-  fd.append('binary', fileEl.files[0]);
-  envText.split('\n').map(l => l.trim()).filter(l => l && l.includes('=')).forEach(l => fd.append('env', l));
-
-  btn.disabled = true;
-  prog.classList.remove('d-none');
-
-  try {
-    const r = await fetch('/_2nnel/deploy' + authQ, {method: 'POST', body: fd,
-      headers: token ? {'Authorization': 'Bearer ' + token} : {}});
-    const body = await r.json();
-    if (!r.ok) throw new Error(body.message || JSON.stringify(body));
-    deployModal.hide();
-    // Brief flash — SSE will show the app in the deployed section
-    alert('Deployed! URL: ' + body.url);
-  } catch(e) {
-    errEl.textContent = String(e);
-    errEl.classList.remove('d-none');
-    btn.disabled = false;
-    prog.classList.add('d-none');
   }
 }
 

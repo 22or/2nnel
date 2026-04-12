@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 
@@ -18,7 +19,43 @@ var serverCmd = &cobra.Command{
 	RunE:  runServer,
 }
 
+var checkCmd = &cobra.Command{
+	Use:   "check",
+	Short: "Check server dependencies (Docker, Nixpacks)",
+	RunE:  runCheck,
+}
+
+func runCheck(_ *cobra.Command, _ []string) error {
+	allOK := true
+
+	out, err := exec.Command("docker", "version", "--format", "{{.Server.Version}}").Output()
+	if err != nil {
+		fmt.Printf("✗ Docker: not found (%v)\n", err)
+		allOK = false
+	} else {
+		fmt.Printf("✓ Docker %s\n", strings.TrimSpace(string(out)))
+	}
+
+	out, err = exec.Command("nixpacks", "--version").Output()
+	if err != nil {
+		fmt.Printf("✗ Nixpacks: not found (%v)\n", err)
+		allOK = false
+	} else {
+		fmt.Printf("✓ Nixpacks %s\n", strings.TrimSpace(string(out)))
+	}
+
+	if allOK {
+		fmt.Println("  Ready for promote.")
+	} else {
+		fmt.Println("\nInstall missing deps:")
+		fmt.Println("  Docker:   apt install docker.io")
+		fmt.Println("  Nixpacks: curl -sSL https://nixpacks.com/install.sh | bash")
+	}
+	return nil
+}
+
 func init() {
+	serverCmd.AddCommand(checkCmd)
 	serverCmd.Flags().String("domain", "", "Base domain for HTTP tunnels (e.g. example.com)")
 	serverCmd.Flags().Int("port", 443, "Public HTTPS port")
 	serverCmd.Flags().String("auth-token", "", "Shared secret for client authentication")

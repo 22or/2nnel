@@ -171,6 +171,7 @@ func (h *controlHandler) registerHTTP(ctrl *proto.ControlConn, reg *proto.Regist
 		tunnelType: "http",
 		subdomain:  subdomain,
 		localAddr:  reg.LocalAddr,
+		hasDir:     reg.HasDir,
 	}
 	h.server.registry.registerHTTP(h.clientID, subdomain, te)
 

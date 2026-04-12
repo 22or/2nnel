@@ -18,6 +18,8 @@ const (
 	TypeHeartbeat        = "heartbeat"
 	TypeAddTunnel        = "add_tunnel"
 	TypeRemoveTunnel     = "remove_tunnel"
+	TypePromote          = "promote"       // server→client: trigger promote upload
+	TypePromoteError     = "promote_error" // client→server: promote failed
 )
 
 // Envelope wraps all control-channel messages.
@@ -54,6 +56,7 @@ type RegisterTunnel struct {
 	Subdomain  string `json:"subdomain"`   // for http tunnels
 	RemotePort int    `json:"remote_port"` // for tcp tunnels
 	LocalAddr  string `json:"local_addr"`
+	HasDir     bool   `json:"has_dir"` // project dir configured; promote available
 }
 
 // TunnelRegistered is sent by server when a tunnel is ready.
@@ -85,6 +88,17 @@ type AddTunnel struct {
 // RemoveTunnel is sent server→client to tear down a tunnel by name.
 type RemoveTunnel struct {
 	Name string `json:"name"`
+}
+
+// Promote is sent server→client to trigger a promote upload for a tunnel.
+type Promote struct {
+	TunnelName string `json:"tunnel_name"`
+}
+
+// PromoteError is sent client→server when promote cannot proceed.
+type PromoteError struct {
+	TunnelName string `json:"tunnel_name"`
+	Error      string `json:"error"`
 }
 
 // StreamHeader is the first thing written on every data stream by the server.

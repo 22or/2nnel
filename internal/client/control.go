@@ -96,6 +96,7 @@ func (s *session) connect() error {
 			Subdomain:  subdomain,
 			RemotePort: t.RemotePort,
 			LocalAddr:  t.Local,
+			HasDir:     t.Dir != "",
 		}
 		if err := ctrl.Send(proto.TypeRegisterTunnel, msg); err != nil {
 			_ = mux.Close()
@@ -167,6 +168,11 @@ func (s *session) controlLoop() {
 			var rt proto.RemoveTunnel
 			if err := env.Unmarshal(&rt); err == nil {
 				s.dynamicRemove(rt.Name)
+			}
+		case proto.TypePromote:
+			var p proto.Promote
+			if err := env.Unmarshal(&p); err == nil {
+				go s.handlePromote(p)
 			}
 		case proto.TypeTunnelRegistered:
 			var tr proto.TunnelRegistered
