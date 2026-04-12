@@ -1,6 +1,6 @@
 # 2nnel
 
-A self-hosted reverse tunnel that exposes local services to the internet through outbound-only connections. Free alternative to ngrok / Cloudflare Tunnel. Single binary, no agents, no accounts.
+Self-hosted reverse tunnel. Exposes local services to the internet through outbound-only connections. Free alternative to ngrok / Cloudflare Tunnel. Single binary, no accounts.
 
 ```
 [Browser] ──► [2nnel server on VPS] ◄══outbound══ [2nnel client behind NAT]
@@ -9,147 +9,181 @@ A self-hosted reverse tunnel that exposes local services to the internet through
 
 ## Features
 
-- **HTTP tunnels** — expose local web apps via subdomain (`myapp.yourdomain.com`)
-- **TCP/SSH tunnels** — expose raw TCP services (SSH, game servers, databases)
-- **Multiplexed** — one outbound WebSocket connection carries all tunnels via yamux
-- **TLS termination** — automatic Let's Encrypt certs via autocert
-- **Auto-reconnect** — client reconnects with exponential backoff
+- **HTTP tunnels** — expose local web apps via subdomain (`myapp.tunnel.example.com`)
+- **TCP tunnels** — raw TCP forwarding (SSH, databases, game servers)
+- **WebSocket support** — WS connections through HTTP tunnels work transparently
+- **Multiplexed** — one outbound WebSocket carries all tunnels via yamux
+- **Dynamic tunnel management** — add/remove tunnels live from the dashboard, no restart needed
+- **Client service install** — one command installs client as a systemd service
+- **Auto-reconnect** — exponential backoff, tunnels restore on reconnect
+- **Admin dashboard** — live metrics, per-tunnel traffic, disconnect controls
 - **Multi-client** — multiple clients, each with independent tunnel sets
 - **YAML config** — full config file support alongside CLI flags
 
-## Quickstart
+## Setup
 
-### 1. Server (VPS)
+### Server (VPS)
+
+**With nginx in front (recommended if nginx already serves other sites):**
 
 ```bash
-# Build
-go build -o 2nnel .
+# Get wildcard cert
+certbot certonly --dns-cloudflare \
+  --dns-cloudflare-credentials ~/.cf-creds.ini \
+  -d tunnel.example.com -d '*.tunnel.example.com'
 
-# Run (autocert — needs port 443 open and a real domain pointing at your VPS)
-sudo ./2nnel server --domain example.com --auth-token supersecret
+# nginx config
+server {
+    listen 443 ssl;
+    server_name tunnel.example.com *.tunnel.example.com;
 
-# Dev mode (no TLS, port 8080)
-./2nnel server --dev --auth-token supersecret
+    ssl_certificate     /etc/letsencrypt/live/tunnel.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/tunnel.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host       $host;
+        proxy_set_header X-Real-IP  $remote_addr;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+    }
+}
+
+server {
+    listen 80;
+    server_name tunnel.example.com *.tunnel.example.com;
+    return 301 https://$host$request_uri;
+}
+
+# Run 2nnel in dev mode (nginx handles TLS)
+./2nnel server \
+    --dev \
+    --port 8080 \
+    --domain tunnel.example.com \
+    --auth-token supersecret \
+    --tcp-port-range 2200-2300
 ```
 
-### 2. Client (local machine)
+**Standalone (2nnel owns 443 directly):**
 
 ```bash
-# Expose localhost:3000 as https://myapp.example.com
+sudo ./2nnel server \
+    --domain example.com \
+    --auth-token supersecret \
+    --tcp-port-range 2200-2300
+```
+
+**DNS records required:**
+
+```
+example.com        A   <VPS IP>
+*.example.com      A   <VPS IP>
+```
+
+**Firewall:**
+
+```bash
+sudo ufw allow 443/tcp
+sudo ufw allow 2200:2300/tcp   # TCP tunnel range
+```
+
+### Client (local machine)
+
+**Run directly:**
+
+```bash
+# HTTP tunnel: myapp.tunnel.example.com → localhost:3000
 ./2nnel client \
-    --server wss://example.com \
+    --server wss://tunnel.example.com \
     --auth-token supersecret \
     --tunnel myapp:localhost:3000
 
-# Also expose SSH on port 2222
+# TCP tunnel (port auto-assigned from server's range)
 ./2nnel client \
-    --server wss://example.com \
+    --server wss://tunnel.example.com \
     --auth-token supersecret \
-    --tunnel myapp:localhost:3000 \
+    --tunnel ssh:localhost:22:tcp
+
+# Explicit remote port
+./2nnel client \
+    --server wss://tunnel.example.com \
+    --auth-token supersecret \
     --tunnel ssh:localhost:22:tcp:2222
 ```
 
-### 3. YAML config file
+**Install as a service** (persists across reboots, tunnels manageable from dashboard):
+
+```bash
+sudo ./2nnel client install \
+    --server wss://tunnel.example.com \
+    --auth-token supersecret \
+    --tunnel myapp:localhost:3000 \
+    --tunnel ssh:localhost:22:tcp
+```
+
+Writes config to `/etc/2nnel/client.yaml`, installs and starts `2nnel-client` systemd service. Logs: `journalctl -u 2nnel-client -f`
+
+**YAML config:**
 
 ```yaml
-server: wss://example.com
+server: wss://tunnel.example.com
 auth_token: supersecret
 tunnels:
-  - name: web
+  - name: myapp
     local: localhost:3000
     type: http
-    subdomain: myapp
   - name: ssh
     local: localhost:22
     type: tcp
-    remote_port: 2222
-  - name: minecraft
-    local: localhost:25565
-    type: tcp
-    remote_port: 25565
 ```
 
 ```bash
 ./2nnel client -c config.yaml
 ```
 
-## Architecture
+### SSH access via tunnel
+
+Add once to `~/.ssh/config` on any machine you SSH from:
 
 ```
-Client                              Server
-──────                              ──────
-WebSocket (outbound) ──────────────► /ws handler
-yamux.Client                         yamux.Server
-  │
-  ├─ stream 1 (control)             Accept stream 1
-  │    JSON messages                 ├─ authenticate client
-  │    ← auth                        ├─ register tunnels
-  │    → auth_ack                    └─ heartbeat loop
-  │    → register_tunnel
-  │    ← tunnel_registered
-  │    ← heartbeat / → heartbeat
-  │
-  └─ Accept loop                    Open new stream per connection
-       read StreamHeader             write StreamHeader
-       dial local service            forward bytes from public traffic
-       pipe bytes ↔
+Host *.tunnel.example.com
+    Port 2200
 ```
 
-**HTTP requests:**
-1. Browser hits `myapp.example.com`
-2. Server matches Host header → finds client yamux session
-3. Server opens new yamux stream, writes `StreamHeader{tunnel_name, local_addr}`
-4. Server writes raw HTTP request on stream, reads response back
-5. Client accept loop: reads header, dials `localhost:3000`, pipes bytes
-
-**TCP connections:**
-1. Server listens on public port (e.g. `:2222`)
-2. Incoming TCP → server opens yamux stream, writes StreamHeader
-3. Client dials local sshd, pipes bytes bidirectionally
-
-## Deployment
-
-### Docker
+Then connect normally:
 
 ```bash
-docker build -t 2nnel .
-docker run -d \
-    -p 443:443 \
-    -v /var/lib/2nnel:/certs \
-    2nnel server \
-        --domain example.com \
-        --auth-token supersecret \
-        --acme-cache /certs
+ssh user@ssh.tunnel.example.com
 ```
 
-### systemd
+## Dashboard
 
-```bash
-# Copy binary
-sudo cp 2nnel /usr/local/bin/
+Visit `https://tunnel.example.com?token=<auth-token>` for the admin dashboard.
 
-# Create user
-sudo useradd -r -s /bin/false 2nnel
-sudo mkdir -p /var/lib/2nnel/certs
-sudo chown 2nnel:2nnel /var/lib/2nnel/certs
+- Live metrics: bytes in/out, request counts, active connections
+- **Add Tunnel** — click `+ Tunnel` on a connected client to add a tunnel without restarting
+- **Remove Tunnel** — remove individual tunnels per client
+- **Disconnect** — forcibly disconnect a client
 
-# Install service (edit domain + token first)
-sudo cp 2nnel.service /etc/systemd/system/
-sudo systemctl enable --now 2nnel
-```
+Tunnels added/removed via dashboard are persisted to the client's config file automatically.
 
 ## Server flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--domain` | | Base domain (e.g. `example.com`) |
+| `--domain` | | Base domain for HTTP tunnels |
 | `--port` | `443` | Public port |
 | `--auth-token` | | Shared secret (empty = no auth) |
-| `--dev` | false | Plain HTTP on port 8080, no TLS |
+| `--dev` | false | Plain HTTP, no TLS (use behind nginx) |
 | `--tls-cert` | | Custom TLS cert (PEM) |
 | `--tls-key` | | Custom TLS key (PEM) |
 | `--acme-cache` | `/tmp/2nnel-certs` | Let's Encrypt cert cache dir |
-| `--allowed-ports` | (all) | Comma-separated allowed TCP ports |
+| `--tcp-port-range` | | Port range for TCP tunnels (e.g. `2200-2300`) |
+| `--allowed-ports` | (all) | Restrict TCP to specific ports |
 
 ## Client flags
 
@@ -161,24 +195,50 @@ sudo systemctl enable --now 2nnel
 | `-c` / `--config` | YAML config file |
 
 **Tunnel spec formats:**
-- HTTP: `name:host:port` (e.g. `web:localhost:3000`)
-- TCP: `name:host:port:tcp:remote_port` (e.g. `ssh:localhost:22:tcp:2222`)
+- HTTP: `name:host:port` → `myapp:localhost:3000`
+- TCP (auto port): `name:host:port:tcp` → `ssh:localhost:22:tcp`
+- TCP (fixed port): `name:host:port:tcp:remote_port` → `ssh:localhost:22:tcp:2222`
 
-## DNS setup
-
-Point a wildcard record at your VPS:
+## Architecture
 
 ```
-*.example.com   A   1.2.3.4
-example.com     A   1.2.3.4
+Client                              Server
+──────                              ──────
+WebSocket (outbound) ──────────────► /ws handler
+yamux.Client                         yamux.Server
+  │
+  ├─ stream 1 (control)             Accept stream 1
+  │    ← auth                        ├─ authenticate
+  │    → auth_ack                    ├─ register tunnels
+  │    → register_tunnel             └─ heartbeat loop
+  │    ← tunnel_registered
+  │    ← heartbeat / → heartbeat
+  │    ← add_tunnel (dashboard)
+  │    → register_tunnel (dynamic)
+  │    ← remove_tunnel (dashboard)
+  │
+  └─ Accept loop                    Open new stream per connection
+       read StreamHeader             write StreamHeader
+       dial local service            forward public traffic
+       pipe bytes ↔
 ```
 
-Let's Encrypt will issue per-subdomain certs automatically on first access.
+**HTTP requests:** server matches `Host` header → opens yamux stream → forwards raw HTTP → client dials local service → pipes bytes.
 
-## Firewall
+**TCP connections:** server listens on assigned port → incoming TCP opens yamux stream → client dials local service → pipes bytes.
 
-On the VPS, open:
-- `443/tcp` — HTTPS + WSS control channel
-- Any TCP ports you allow for TCP tunnels (e.g. `2222/tcp` for SSH)
+**WebSocket through HTTP tunnel:** server detects `Upgrade: websocket` → hijacks connection → pipes raw bytes over yamux stream.
 
-The client needs only outbound port 443.
+## Docker
+
+```bash
+docker build -t 2nnel .
+docker run -d \
+    -p 443:443 -p 80:80 \
+    -v /var/lib/2nnel:/certs \
+    2nnel server \
+        --domain example.com \
+        --auth-token supersecret \
+        --acme-cache /certs \
+        --tcp-port-range 2200-2300
+```
