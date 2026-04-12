@@ -90,10 +90,12 @@ func (s *Server) handlePromoteUpload(w http.ResponseWriter, r *http.Request) {
 	nixCmd.Env = append(os.Environ(), "DOCKER_BUILDKIT=0")
 	buildOut, err := nixCmd.CombinedOutput()
 	if err != nil {
+		slog.Error("promote: nixpacks build failed", "name", name, "err", err, "output", string(buildOut))
 		os.RemoveAll(dir)
 		http.Error(w, fmt.Sprintf("nixpacks build failed:\n%s", buildOut), http.StatusInternalServerError)
 		return
 	}
+	slog.Info("promote: nixpacks build complete", "name", name)
 
 	port, err := pickFreePort()
 	if err != nil {
