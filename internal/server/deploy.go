@@ -2,19 +2,21 @@ package server
 
 import (
 	"archive/tar"
+	"bufio"
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -32,6 +34,42 @@ type deployedApp struct {
 
 	requests    atomic.Int64
 	activeConns atomic.Int32
+}
+
+// pendingBuild tracks a nixpacks build in progress so the dashboard can show live logs.
+type pendingBuild struct {
+	name      string
+	startedAt time.Time
+	mu        sync.Mutex
+	lines     []string
+	errMsg    string // non-empty on failure
+	done      bool
+}
+
+func (b *pendingBuild) appendLine(line string) {
+	b.mu.Lock()
+	b.lines = append(b.lines, line)
+	b.mu.Unlock()
+}
+
+func (b *pendingBuild) finish(errMsg string) {
+	b.mu.Lock()
+	b.errMsg = errMsg
+	b.done = true
+	b.mu.Unlock()
+}
+
+// snapshot returns the last 50 lines plus current status.
+func (b *pendingBuild) snapshot() (lines []string, errMsg string, done bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	src := b.lines
+	if len(src) > 50 {
+		src = src[len(src)-50:]
+	}
+	lines = make([]string, len(src))
+	copy(lines, src)
+	return lines, b.errMsg, b.done
 }
 
 // handlePromoteUpload handles POST /_2nnel/promote — receives a tarball, builds with
@@ -84,32 +122,48 @@ func (s *Server) handlePromoteUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build with Nixpacks. Disable BuildKit to avoid requiring docker-buildx.
+	// Register a pending build so the dashboard can show live progress.
+	build := &pendingBuild{name: name, startedAt: time.Now()}
+	s.pendingBuilds.Store(name, build)
+
+	// Build with Nixpacks — stream output line-by-line into build log.
 	slog.Info("promote: nixpacks build", "name", name, "dir", dir)
 	nixCmd := exec.Command("nixpacks", "build", dir, "--name", name)
 	nixCmd.Env = append(os.Environ(), "DOCKER_BUILDKIT=0")
-	buildOut, err := nixCmd.CombinedOutput()
-	if err != nil {
-		slog.Error("promote: nixpacks build failed", "name", name, "err", err, "output", string(buildOut))
+	pr, pw := io.Pipe()
+	nixCmd.Stdout = pw
+	nixCmd.Stderr = pw
+	scanDone := make(chan struct{})
+	go func() {
+		defer close(scanDone)
+		sc := bufio.NewScanner(pr)
+		for sc.Scan() {
+			build.appendLine(sc.Text())
+		}
+	}()
+	buildErr := nixCmd.Run()
+	pw.Close()
+	<-scanDone // ensure all output is captured before we inspect it
+
+	if buildErr != nil {
+		lines, _, _ := build.snapshot()
+		buildLog := strings.Join(lines, "\n")
+		slog.Error("promote: nixpacks build failed", "name", name, "err", buildErr)
+		build.finish("nixpacks build failed: " + buildErr.Error())
 		os.RemoveAll(dir)
-		http.Error(w, fmt.Sprintf("nixpacks build failed:\n%s", buildOut), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("nixpacks build failed:\n%s", buildLog), http.StatusInternalServerError)
 		return
 	}
+	build.appendLine("✓ Build complete — starting container…")
 	slog.Info("promote: nixpacks build complete", "name", name)
 
-	port, err := pickFreePort()
-	if err != nil {
-		os.RemoveAll(dir)
-		http.Error(w, "pick port: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Build docker run args.
+	// Build docker run args. Use --network host so the container shares the host's
+	// network namespace — no port mapping needed, and we can detect the actual
+	// listening port at runtime regardless of what the app uses.
 	args := []string{
 		"run", "-d", "--restart=unless-stopped",
+		"--network", "host",
 		"--name", "2nnel-" + name,
-		"-e", fmt.Sprintf("PORT=%d", port),
-		"-p", fmt.Sprintf("127.0.0.1:%d:%d", port, port),
 	}
 	envFile := filepath.Join(dir, ".env")
 	if _, statErr := os.Stat(envFile); statErr == nil {
@@ -117,14 +171,30 @@ func (s *Server) handlePromoteUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	args = append(args, name)
 
-	slog.Info("promote: docker run", "name", name, "port", port)
+	build.appendLine("Starting container…")
+	slog.Info("promote: docker run", "name", name)
 	out, err := exec.Command("docker", args...).Output()
 	if err != nil {
+		build.finish("docker run failed: " + err.Error())
 		os.RemoveAll(dir)
 		http.Error(w, fmt.Sprintf("docker run failed: %v", err), http.StatusInternalServerError)
 		return
 	}
 	containerID := strings.TrimSpace(string(out))
+
+	// Detect the actual port the app is listening on. Poll ss inside the container
+	// so we catch the real port regardless of PORT env, framework defaults, or
+	// custom config. Timeout after 60 s to handle slow startup (npm, Python, etc.).
+	port, err := detectContainerPort(containerID, 60*time.Second)
+	if err != nil {
+		build.finish("container started but app never listened: " + err.Error())
+		exec.Command("docker", "stop", containerID).Run()
+		exec.Command("docker", "rm", containerID).Run()
+		os.RemoveAll(dir)
+		http.Error(w, "detect app port: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	slog.Info("promote: app listening", "name", name, "port", port)
 
 	app := &deployedApp{
 		name:        name,
@@ -134,8 +204,10 @@ func (s *Server) handlePromoteUpload(w http.ResponseWriter, r *http.Request) {
 		dir:         dir,
 		startedAt:   time.Now(),
 	}
-	// Store deployed app first so traffic routes to Docker immediately.
+	// Store deployed app so traffic routes to Docker immediately,
+	// then remove the pending build — it's now visible as a deployed app.
 	s.deployedApps.Store(name, app)
+	s.pendingBuilds.Delete(name)
 
 	// Evict the client tunnel using this subdomain (if any) — it handed off to Docker.
 	s.registry.mu.RLock()
@@ -282,15 +354,44 @@ func extractTarball(r io.Reader, dir string) error {
 	return nil
 }
 
-// pickFreePort finds a free localhost TCP port by binding to :0.
-func pickFreePort() (int, error) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
+// detectContainerPort polls ss inside the running container until it finds a
+// user-space TCP port (>1024) the app is listening on. Works regardless of
+// whether the app respects PORT, uses a framework default, or reads custom config.
+func detectContainerPort(containerID string, timeout time.Duration) (int, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("docker", "exec", containerID, "ss", "-Htlnp").Output()
+		if err == nil {
+			if port := parseFirstUserPort(out); port > 0 {
+				return port, nil
+			}
+		}
+		time.Sleep(2 * time.Second)
 	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
-	return port, nil
+	return 0, fmt.Errorf("app did not start listening within %s", timeout)
+}
+
+// parseFirstUserPort parses ss -Htlnp output and returns the first listening
+// port above 1024 (skipping privileged and well-known system ports).
+func parseFirstUserPort(ssOut []byte) int {
+	for _, line := range strings.Split(string(ssOut), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			continue
+		}
+		// Local address is fields[3]: "0.0.0.0:4200", ":::3000", "*:8080"
+		addr := fields[3]
+		i := strings.LastIndex(addr, ":")
+		if i < 0 {
+			continue
+		}
+		p, err := strconv.Atoi(addr[i+1:])
+		if err != nil || p <= 1024 {
+			continue
+		}
+		return p
+	}
+	return 0
 }
 
 // isValidDeployName returns true if name is alphanumeric+hyphen and ≤40 chars.

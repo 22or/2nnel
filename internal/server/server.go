@@ -23,10 +23,11 @@ import (
 
 // Server is the 2nnel relay server.
 type Server struct {
-	cfg          *config.ServerConfig
-	registry     *Registry
-	upgrader     websocket.Upgrader
-	deployedApps sync.Map // key: name string → *deployedApp
+	cfg           *config.ServerConfig
+	registry      *Registry
+	upgrader      websocket.Upgrader
+	deployedApps  sync.Map // key: name string → *deployedApp
+	pendingBuilds sync.Map // key: name string → *pendingBuild
 }
 
 // New creates a Server with cfg.

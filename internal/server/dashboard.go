@@ -36,6 +36,11 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/promote/") && r.Method == http.MethodDelete:
 		name := strings.TrimPrefix(path, "/promote/")
 		s.handleDeleteDeploy(w, r, name)
+	case strings.HasPrefix(path, "/builds/") && r.Method == http.MethodDelete:
+		name := strings.TrimPrefix(path, "/builds/")
+		s.pendingBuilds.Delete(name)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"ok":true}`)
 	case strings.HasPrefix(path, "/clients/") && strings.HasSuffix(path, "/disconnect") && r.Method == http.MethodPost:
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/clients/"), "/disconnect")
 		s.handleDisconnect(w, r, id)
@@ -116,11 +121,21 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 }
 
 type ssePayload struct {
-	UptimeSeconds float64          `json:"uptime_seconds"`
-	ServerTime    string           `json:"server_time"`
-	Clients       []sseClient      `json:"clients"`
-	Totals        sseTotals        `json:"totals"`
-	DeployedApps  []sseDeployedApp `json:"deployed_apps"`
+	UptimeSeconds float64           `json:"uptime_seconds"`
+	ServerTime    string            `json:"server_time"`
+	Clients       []sseClient       `json:"clients"`
+	Totals        sseTotals         `json:"totals"`
+	DeployedApps  []sseDeployedApp  `json:"deployed_apps"`
+	PendingBuilds []ssePendingBuild `json:"pending_builds"`
+}
+
+type ssePendingBuild struct {
+	Name      string   `json:"name"`
+	StartedAt string   `json:"started_at"`
+	ElapsedS  int      `json:"elapsed_s"`
+	Lines     []string `json:"lines"`
+	Error     string   `json:"error,omitempty"`
+	Done      bool     `json:"done"`
 }
 
 type sseDeployedApp struct {
@@ -250,12 +265,29 @@ func (s *Server) buildSSEPayload() ssePayload {
 		return true
 	})
 
+	// Pending builds
+	var pendingBuilds []ssePendingBuild
+	s.pendingBuilds.Range(func(k, v any) bool {
+		b := v.(*pendingBuild)
+		lines, errMsg, done := b.snapshot()
+		pendingBuilds = append(pendingBuilds, ssePendingBuild{
+			Name:      b.name,
+			StartedAt: b.startedAt.UTC().Format(time.RFC3339),
+			ElapsedS:  int(time.Since(b.startedAt).Seconds()),
+			Lines:     lines,
+			Error:     errMsg,
+			Done:      done,
+		})
+		return true
+	})
+
 	return ssePayload{
 		UptimeSeconds: time.Since(startTime).Seconds(),
 		ServerTime:    now.UTC().Format(time.RFC3339),
 		Clients:       clients,
 		Totals:        totals,
 		DeployedApps:  deployedApps,
+		PendingBuilds: pendingBuilds,
 	}
 }
 

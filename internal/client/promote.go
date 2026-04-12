@@ -139,15 +139,11 @@ func createTarball(dir string) (*bytes.Buffer, error) {
 			return filepath.SkipDir
 		}
 
-		// .env is always included even if gitignored.
-		includeAnyway := base == ".env"
-
-		// Check gitignore patterns.
-		if !includeAnyway && isGitignored(rel, base, ignorePatterns) {
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
+		// Apply gitignore only to directories — individual source files are always
+		// included regardless of gitignore (gitignore is "don't commit", not "don't build";
+		// many frameworks require gitignored files like environment configs for builds).
+		if d.IsDir() && isGitignored(rel, base, ignorePatterns) {
+			return filepath.SkipDir
 		}
 
 		// Directories themselves don't need tar entries — files implicitly create them.

@@ -40,6 +40,11 @@
     a.endpoint:hover { text-decoration: underline; color: #a5d6ff; }
     .local-addr { font-family: monospace; color: #8b949e; font-size: 0.8rem; }
     .metric-val { font-weight: 600; }
+    .build-log { background: #0d1117; border-radius: 0 0 8px 8px; max-height: 200px; overflow-y: auto; font-family: monospace; font-size: 0.72rem; color: #8b949e; padding: 10px 16px; }
+    .build-log .line { white-space: pre-wrap; word-break: break-all; line-height: 1.5; }
+    .build-log .line.error { color: #f85149; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner { display: inline-block; width: 10px; height: 10px; border: 2px solid #484f58; border-top-color: #58a6ff; border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 6px; }
   </style>
 </head>
 <body>
@@ -87,6 +92,9 @@
       </div>
     </div>
   </div>
+
+  <!-- Pending builds -->
+  <div id="pending-builds-container"></div>
 
   <!-- Deployed apps -->
   <div id="deployed-container"></div>
@@ -151,6 +159,7 @@
 <script>
 const token = new URLSearchParams(location.search).get('token') || '';
 const authQ = token ? '?token=' + encodeURIComponent(token) : '';
+const buildingTunnels = new Set(); // tracks names currently being built
 
 function fmtBytes(n) {
   if (n >= 1073741824) return (n / 1073741824).toFixed(1) + ' GB';
@@ -180,7 +189,9 @@ function renderTunnel(t) {
          <button class="btn btn-outline-secondary btn-remove-tunnel"
            onclick="setTunnelDir('${escHtml(t.client_id)}','${escHtml(t.name)}','${escHtml(t.dir||'')}')">Edit Dir</button>
          <button class="btn btn-outline-warning btn-remove-tunnel"
-           onclick="promoteTunnel('${escHtml(t.client_id)}','${escHtml(t.name)}',this)">Promote</button>`
+           ${buildingTunnels.has(t.name) ? 'disabled' : ''}
+           onclick="promoteTunnel('${escHtml(t.client_id)}','${escHtml(t.name)}')">
+           ${buildingTunnels.has(t.name) ? 'Building…' : 'Promote'}</button>`
       : `<button class="btn btn-outline-secondary btn-remove-tunnel"
            onclick="setTunnelDir('${escHtml(t.client_id)}','${escHtml(t.name)}','')">Set Dir</button>`
   ) : '';
@@ -256,6 +267,44 @@ function renderDeployedApp(app) {
     </div>`;
 }
 
+function fmtElapsed(s) {
+  if (s < 60) return s + 's';
+  return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+}
+
+function renderPendingBuild(b) {
+  const statusBadge = b.done && b.error
+    ? `<span class="badge bg-danger">FAILED</span>`
+    : b.done
+      ? `<span class="badge bg-success">DONE</span>`
+      : `<span class="badge bg-warning text-dark"><span class="spinner"></span>BUILDING</span>`;
+
+  const elapsed = b.done ? '' : `<span class="text-secondary" style="font-size:0.8rem;">${fmtElapsed(b.elapsed_s)}</span>`;
+
+  const dismissBtn = b.done
+    ? `<button class="btn btn-outline-secondary btn-disconnect ms-auto"
+         onclick="dismissBuild('${escHtml(b.name)}')">Dismiss</button>`
+    : '';
+
+  const lines = b.lines || [];
+  const logLines = lines.map(l => {
+    const isErr = l.includes('ERROR') || l.includes('error') || l.includes('failed');
+    return `<div class="line${isErr ? ' error' : ''}">${escHtml(l)}</div>`;
+  }).join('');
+  const errorLine = b.error ? `<div class="line error">${escHtml(b.error)}</div>` : '';
+
+  return `
+    <div class="client-card mb-3">
+      <div class="client-header px-4 py-2 d-flex align-items-center gap-3 flex-wrap">
+        ${statusBadge}
+        <span class="font-monospace fw-bold" style="color:#e6edf3;">${escHtml(b.name)}</span>
+        ${elapsed}
+        ${dismissBtn}
+      </div>
+      <div class="build-log" id="build-log-${escHtml(b.name)}">${logLines}${errorLine}</div>
+    </div>`;
+}
+
 function render(data) {
   // Stats
   document.getElementById('stat-clients').textContent = data.totals.clients;
@@ -269,6 +318,31 @@ function render(data) {
   const h = Math.floor(u / 3600), m = Math.floor((u % 3600) / 60), sec = Math.floor(u % 60);
   document.getElementById('uptime-badge').textContent =
     'uptime: ' + (h ? h+'h '+m+'m' : m ? m+'m '+sec+'s' : sec+'s');
+
+  // Pending builds — track scroll position before re-render so we can restore it
+  const pendingContainer = document.getElementById('pending-builds-container');
+  const scrollPositions = {};
+  if (data.pending_builds) {
+    for (const b of data.pending_builds) {
+      const el = document.getElementById('build-log-' + b.name);
+      if (el) scrollPositions[b.name] = el.scrollTop;
+      if (b.done) buildingTunnels.delete(b.name);
+    }
+    pendingContainer.innerHTML = data.pending_builds.map(renderPendingBuild).join('');
+    for (const b of data.pending_builds) {
+      const el = document.getElementById('build-log-' + b.name);
+      if (!el) continue;
+      // Auto-scroll to bottom unless user has scrolled up
+      const prev = scrollPositions[b.name];
+      if (prev === undefined || prev >= el.scrollHeight - el.clientHeight - 5) {
+        el.scrollTop = el.scrollHeight;
+      } else {
+        el.scrollTop = prev;
+      }
+    }
+  } else {
+    pendingContainer.innerHTML = '';
+  }
 
   // Deployed apps
   const deployedContainer = document.getElementById('deployed-container');
@@ -305,10 +379,10 @@ async function setTunnelDir(clientId, tunnelName, currentDir) {
   } catch(e) { alert('Error: ' + e); }
 }
 
-async function promoteTunnel(clientId, name, btn) {
+async function promoteTunnel(clientId, name) {
+  if (buildingTunnels.has(name)) return;
   if (!confirm('Promote "' + name + '" to a permanent deployed app?\n\nThe server will build and run it with Docker + Nixpacks.\nThis may take a few minutes.')) return;
-  btn.disabled = true;
-  btn.textContent = 'Building…';
+  buildingTunnels.add(name);
   try {
     const r = await fetch(
       '/_2nnel/clients/' + encodeURIComponent(clientId) + '/tunnels/' + encodeURIComponent(name) + '/promote' + authQ,
@@ -316,16 +390,19 @@ async function promoteTunnel(clientId, name, btn) {
     );
     if (!r.ok) {
       alert('Error: ' + await r.text());
-      btn.disabled = false;
-      btn.textContent = 'Promote';
-    } else {
-      btn.textContent = 'Building… (watch deployed section)';
+      buildingTunnels.delete(name);
     }
+    // on success: pending build card appears via SSE; button stays disabled until build finishes
   } catch(e) {
     alert('Error: ' + e);
-    btn.disabled = false;
-    btn.textContent = 'Promote';
+    buildingTunnels.delete(name);
   }
+}
+
+async function dismissBuild(name) {
+  try {
+    await fetch('/_2nnel/builds/' + encodeURIComponent(name) + authQ, {method: 'DELETE'});
+  } catch(e) { alert('Error: ' + e); }
 }
 
 async function stopDeploy(name) {
