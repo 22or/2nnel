@@ -241,10 +241,11 @@ func (s *session) dynamicAdd(at proto.AddTunnel) {
 
 // setTunnelDir updates the project directory for a tunnel (sent by server from dashboard).
 func (s *session) setTunnelDir(msg proto.SetTunnelDir) {
+	dir := expandHome(msg.Dir)
 	s.cfgMu.Lock()
 	for i, t := range s.cfg.Tunnels {
 		if t.Name == msg.TunnelName {
-			s.cfg.Tunnels[i].Dir = msg.Dir
+			s.cfg.Tunnels[i].Dir = dir
 			break
 		}
 	}

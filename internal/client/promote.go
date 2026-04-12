@@ -43,6 +43,7 @@ func (s *session) handlePromote(p proto.Promote) {
 		return
 	}
 
+	dir = expandHome(dir)
 	slog.Info("promote: creating tarball", "tunnel", p.TunnelName, "dir", dir)
 	tarball, err := createTarball(dir)
 	if err != nil {
@@ -217,6 +218,18 @@ func isGitignored(rel, base string, patterns []string) bool {
 		}
 	}
 	return false
+}
+
+// expandHome replaces a leading ~ with the current user's home directory.
+func expandHome(path string) string {
+	if !strings.HasPrefix(path, "~") {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	return filepath.Join(home, path[1:])
 }
 
 // wsToHTTP converts wss:// → https://, ws:// → http://, leaves https/http unchanged.
