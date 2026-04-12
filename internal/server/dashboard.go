@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/22or/2nnel/internal/proto"
+	"github.com/gorilla/websocket"
 )
 
 //go:embed web/index.html
@@ -41,6 +42,9 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		} else {
 			http.NotFound(w, r)
 		}
+	case strings.HasPrefix(path, "/tcp/"):
+		name := strings.TrimPrefix(path, "/tcp/")
+		s.handleTCPOverWS(w, r, name)
 	default:
 		http.NotFound(w, r)
 	}
@@ -193,6 +197,58 @@ func (s *Server) buildSSEPayload() ssePayload {
 		Clients:       clients,
 		Totals:        totals,
 	}
+}
+
+// handleTCPOverWS proxies a named TCP tunnel over a WebSocket connection.
+// Allows TCP tunnels to be reached through port 443 (e.g. SSH through corporate VPN).
+// Endpoint: GET /_2nnel/tcp/{tunnel-name}  (WebSocket upgrade)
+func (s *Server) handleTCPOverWS(w http.ResponseWriter, r *http.Request, tunnelName string) {
+	// Find the client entry that owns this tunnel.
+	var entry *clientEntry
+	var te *tunnelEntry
+	s.registry.mu.RLock()
+	for _, e := range s.registry.byID {
+		e.mu.RLock()
+		for _, t := range e.tunnels {
+			if t.name == tunnelName && t.tunnelType == "tcp" {
+				entry = e
+				te = t
+				break
+			}
+		}
+		e.mu.RUnlock()
+		if entry != nil {
+			break
+		}
+	}
+	s.registry.mu.RUnlock()
+
+	if entry == nil {
+		http.Error(w, fmt.Sprintf("no TCP tunnel %q registered", tunnelName), http.StatusNotFound)
+		return
+	}
+
+	ws, err := s.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer ws.Close()
+
+	stream, err := entry.session.Open()
+	if err != nil {
+		_ = ws.WriteMessage(websocket.CloseMessage, []byte("tunnel unavailable"))
+		return
+	}
+	defer stream.Close()
+
+	if err := writeStreamHdr(stream, te.name, te.localAddr); err != nil {
+		return
+	}
+
+	te.activeConns.Add(1)
+	defer te.activeConns.Add(-1)
+
+	pipe(proto.NewWSConn(ws), &countingStream{ReadWriteCloser: stream, te: te})
 }
 
 // handleAddTunnel relays an AddTunnel command to a connected client.
