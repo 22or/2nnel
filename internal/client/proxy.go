@@ -3,6 +3,7 @@ package client
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -30,15 +31,16 @@ func handleDataStream(stream io.ReadWriteCloser, cfg *config.ClientConfig) {
 		return
 	}
 
-	// Find local address from config.
+	// Find local address and tunnel type from config.
 	localAddr := hdr.LocalAddr
-	if localAddr == "" {
-		// Fall back to config lookup by name.
-		for _, t := range cfg.Tunnels {
-			if t.Name == hdr.TunnelName {
+	tunnelType := "http" // default; used for error response shape
+	for _, t := range cfg.Tunnels {
+		if t.Name == hdr.TunnelName {
+			if localAddr == "" {
 				localAddr = t.Local
-				break
 			}
+			tunnelType = t.Type
+			break
 		}
 	}
 	if localAddr == "" {
@@ -49,6 +51,13 @@ func handleDataStream(stream io.ReadWriteCloser, cfg *config.ClientConfig) {
 	local, err := net.Dial("tcp", localAddr)
 	if err != nil {
 		slog.Error("dial local service", "addr", localAddr, "err", err)
+		// For HTTP tunnels the server is waiting on http.ReadResponse — write a
+		// proper 502 so it gets a valid response instead of unexpected EOF.
+		if tunnelType != "tcp" {
+			msg := "service unavailable: " + err.Error()
+			fmt.Fprintf(stream, "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+				len(msg), msg)
+		}
 		return
 	}
 	defer local.Close()
