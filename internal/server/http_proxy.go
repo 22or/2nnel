@@ -25,6 +25,11 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	entry, ok := s.registry.lookupHTTP(subdomain)
 	if !ok {
+		// Check deployed apps before returning 502.
+		if val, ok := s.deployedApps.Load(subdomain); ok {
+			s.serveDeployedApp(w, r, val.(*deployedApp))
+			return
+		}
 		http.Error(w, fmt.Sprintf("no tunnel registered for subdomain %q", subdomain), http.StatusBadGateway)
 		return
 	}

@@ -28,6 +28,7 @@ func init() {
 	serverCmd.Flags().String("acme-cache", "/tmp/2nnel-certs", "Directory for Let's Encrypt cert cache")
 	serverCmd.Flags().IntSlice("allowed-ports", nil, "Allowed TCP ports for TCP tunnels (empty = all)")
 	serverCmd.Flags().String("tcp-port-range", "", "Port range for auto-assigned TCP tunnels (e.g. 2200-2300)")
+	serverCmd.Flags().String("deploy-dir", "", "Base directory for deployed app binaries (default: system temp dir)")
 }
 
 func runServer(cmd *cobra.Command, args []string) error {
@@ -44,6 +45,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	acmeCache, _ := f.GetString("acme-cache")
 	allowedPorts, _ := f.GetIntSlice("allowed-ports")
 	tcpPortRange, _ := f.GetString("tcp-port-range")
+	deployDir, _ := f.GetString("deploy-dir")
 	tcpPortMin, tcpPortMax, err := parseTCPPortRange(tcpPortRange)
 	if err != nil {
 		return err
@@ -60,6 +62,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 		AllowedPorts: allowedPorts,
 		TCPPortMin:   tcpPortMin,
 		TCPPortMax:   tcpPortMax,
+		DeployDir:    deployDir,
 	}
 
 	if dev {

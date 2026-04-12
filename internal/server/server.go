@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -22,9 +23,10 @@ import (
 
 // Server is the 2nnel relay server.
 type Server struct {
-	cfg      *config.ServerConfig
-	registry *Registry
-	upgrader websocket.Upgrader
+	cfg          *config.ServerConfig
+	registry     *Registry
+	upgrader     websocket.Upgrader
+	deployedApps sync.Map // key: name string → *deployedApp
 }
 
 // New creates a Server with cfg.
@@ -83,6 +85,7 @@ func (s *Server) Run() error {
 		slog.Info("shutdown signal")
 		shutCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
+		s.stopAllDeployedApps()
 		_ = srv.Shutdown(shutCtx)
 		s.registry.closeAll()
 	}()
@@ -118,6 +121,12 @@ func (s *Server) adminAuth(next http.Handler) http.Handler {
 					_ = user
 				}
 			}
+			if tok == "" {
+				bearer := r.Header.Get("Authorization")
+				if strings.HasPrefix(bearer, "Bearer ") {
+					tok = strings.TrimPrefix(bearer, "Bearer ")
+				}
+			}
 			if tok != s.cfg.AuthToken {
 				w.Header().Set("WWW-Authenticate", `Basic realm="2nnel admin"`)
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -126,6 +135,22 @@ func (s *Server) adminAuth(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// buildPublicHTTPURL constructs the full public URL for an HTTP tunnel subdomain.
+func (s *Server) buildPublicHTTPURL(subdomain string) string {
+	cfg := s.cfg
+	if cfg.Domain == "" {
+		return fmt.Sprintf("(subdomain: %s)", subdomain)
+	}
+	scheme := "https"
+	if cfg.Dev {
+		scheme = "http"
+	}
+	if (scheme == "https" && cfg.Port == 443) || (scheme == "http" && cfg.Port == 80) {
+		return fmt.Sprintf("%s://%s.%s", scheme, subdomain, cfg.Domain)
+	}
+	return fmt.Sprintf("%s://%s.%s:%d", scheme, subdomain, cfg.Domain, cfg.Port)
 }
 
 // handleControl upgrades a WebSocket connection from a client and manages the control session.

@@ -27,6 +27,14 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		s.handleMetrics(w, r)
 	case path == "/stream":
 		s.handleSSE(w, r)
+	case path == "/deploy" && r.Method == http.MethodPost:
+		s.handleDeploy(w, r)
+	case strings.HasPrefix(path, "/deploy/") && strings.HasSuffix(path, "/logs") && r.Method == http.MethodGet:
+		name := strings.TrimSuffix(strings.TrimPrefix(path, "/deploy/"), "/logs")
+		s.handleDeployLogs(w, r, name)
+	case strings.HasPrefix(path, "/deploy/") && r.Method == http.MethodDelete:
+		name := strings.TrimPrefix(path, "/deploy/")
+		s.handleDeleteDeploy(w, r, name)
 	case strings.HasPrefix(path, "/clients/") && strings.HasSuffix(path, "/disconnect") && r.Method == http.MethodPost:
 		id := strings.TrimSuffix(strings.TrimPrefix(path, "/clients/"), "/disconnect")
 		s.handleDisconnect(w, r, id)
@@ -93,6 +101,18 @@ type ssePayload struct {
 	ServerTime    string           `json:"server_time"`
 	Clients       []sseClient      `json:"clients"`
 	Totals        sseTotals        `json:"totals"`
+	DeployedApps  []sseDeployedApp `json:"deployed_apps"`
+}
+
+type sseDeployedApp struct {
+	Name        string   `json:"name"`
+	PublicURL   string   `json:"public_url"`
+	Port        int      `json:"port"`
+	Restarts    int      `json:"restarts"`
+	LastStart   string   `json:"last_start"`
+	Requests    int64    `json:"requests"`
+	ActiveConns int      `json:"active_conns"`
+	RecentLogs  []string `json:"recent_logs"`
 }
 
 type sseClient struct {
@@ -187,11 +207,47 @@ func (s *Server) buildSSEPayload() ssePayload {
 		})
 	}
 
+	// Deployed apps
+	var deployedApps []sseDeployedApp
+	s.deployedApps.Range(func(k, v any) bool {
+		app := v.(*deployedApp)
+		app.mu.Lock()
+		port := app.port
+		restarts := app.restarts
+		lastStart := app.lastStart
+		app.mu.Unlock()
+
+		app.logMu.Lock()
+		var recentLogs []string
+		if n := len(app.logBuf); n > 0 {
+			start := n - 10
+			if start < 0 {
+				start = 0
+			}
+			recentLogs = make([]string, n-start)
+			copy(recentLogs, app.logBuf[start:])
+		}
+		app.logMu.Unlock()
+
+		deployedApps = append(deployedApps, sseDeployedApp{
+			Name:        app.name,
+			PublicURL:   s.buildPublicHTTPURL(app.subdomain),
+			Port:        port,
+			Restarts:    restarts,
+			LastStart:   lastStart.UTC().Format(time.RFC3339),
+			Requests:    app.requests.Load(),
+			ActiveConns: int(app.activeConns.Load()),
+			RecentLogs:  recentLogs,
+		})
+		return true
+	})
+
 	return ssePayload{
 		UptimeSeconds: time.Since(startTime).Seconds(),
 		ServerTime:    now.UTC().Format(time.RFC3339),
 		Clients:       clients,
 		Totals:        totals,
+		DeployedApps:  deployedApps,
 	}
 }
 

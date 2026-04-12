@@ -23,4 +23,6 @@ func Execute() {
 func init() {
 	rootCmd.AddCommand(serverCmd)
 	rootCmd.AddCommand(clientCmd)
+	rootCmd.AddCommand(shareCmd)
+	rootCmd.AddCommand(deployCmd)
 }

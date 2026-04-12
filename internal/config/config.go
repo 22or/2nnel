@@ -12,6 +12,7 @@ type ServerConfig struct {
 	AllowedPorts []int
 	TCPPortMin   int
 	TCPPortMax   int
+	DeployDir    string // base dir for deployed app binaries (default: os.TempDir())
 }
 
 // ClientConfig holds all client-side settings (from flags or YAML).

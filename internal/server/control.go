@@ -158,6 +158,13 @@ func (h *controlHandler) registerHTTP(ctrl *proto.ControlConn, reg *proto.Regist
 		})
 		return
 	}
+	if _, taken := h.server.deployedApps.Load(subdomain); taken {
+		_ = ctrl.Send(proto.TypeTunnelError, proto.TunnelError{
+			Name:  reg.Name,
+			Error: fmt.Sprintf("subdomain %q already in use by a deployed app", subdomain),
+		})
+		return
+	}
 
 	te := &tunnelEntry{
 		name:       reg.Name,
@@ -167,27 +174,12 @@ func (h *controlHandler) registerHTTP(ctrl *proto.ControlConn, reg *proto.Regist
 	}
 	h.server.registry.registerHTTP(h.clientID, subdomain, te)
 
-	publicURL := h.buildHTTPURL(subdomain)
+	publicURL := h.server.buildPublicHTTPURL(subdomain)
 	_ = ctrl.Send(proto.TypeTunnelRegistered, proto.TunnelRegistered{
 		Name:      reg.Name,
 		PublicURL: publicURL,
 	})
 	slog.Info("HTTP tunnel registered", "client", h.clientID, "subdomain", subdomain, "url", publicURL)
-}
-
-func (h *controlHandler) buildHTTPURL(subdomain string) string {
-	cfg := h.server.cfg
-	if cfg.Domain == "" {
-		return fmt.Sprintf("(subdomain: %s)", subdomain)
-	}
-	scheme := "https"
-	if cfg.Dev {
-		scheme = "http"
-	}
-	if (scheme == "https" && cfg.Port == 443) || (scheme == "http" && cfg.Port == 80) {
-		return fmt.Sprintf("%s://%s.%s", scheme, subdomain, cfg.Domain)
-	}
-	return fmt.Sprintf("%s://%s.%s:%d", scheme, subdomain, cfg.Domain, cfg.Port)
 }
 
 func (h *controlHandler) registerTCP(ctrl *proto.ControlConn, reg *proto.RegisterTunnel) {
