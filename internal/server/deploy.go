@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -28,7 +29,8 @@ type deployedApp struct {
 	name        string
 	subdomain   string
 	containerID string
-	port        int
+	listenAddr  string // host:port the app is actually accepting connections on
+	port        int    // numeric port (for display)
 	dir         string // extracted project dir on server
 	startedAt   time.Time
 
@@ -187,8 +189,9 @@ func (s *Server) handlePromoteUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	containerID := strings.TrimSpace(string(out))
 
-	// Poll the host's listening ports until a new one appears (the app's port).
-	port, err := detectContainerPort(knownPorts, 60*time.Second)
+	// Poll host ports until a new one appears, then probe IPv4/IPv6 to find
+	// the actual connectable address (app may bind to ::1 not 127.0.0.1).
+	listenAddr, err := detectContainerPort(knownPorts, 60*time.Second)
 	if err != nil {
 		build.finish("container started but app never listened: " + err.Error())
 		exec.Command("docker", "stop", containerID).Run()
@@ -197,13 +200,20 @@ func (s *Server) handlePromoteUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "detect app port: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	slog.Info("promote: app listening", "name", name, "port", port)
+	slog.Info("promote: app listening", "name", name, "addr", listenAddr)
+
+	// Parse port number from listenAddr for display.
+	displayPort := 0
+	if _, portStr, splitErr := net.SplitHostPort(listenAddr); splitErr == nil {
+		displayPort, _ = strconv.Atoi(portStr)
+	}
 
 	app := &deployedApp{
 		name:        name,
 		subdomain:   name,
 		containerID: containerID,
-		port:        port,
+		listenAddr:  listenAddr,
+		port:        displayPort,
 		dir:         dir,
 		startedAt:   time.Now(),
 	}
@@ -280,9 +290,9 @@ func (s *Server) handleDeployLogs(w http.ResponseWriter, r *http.Request, name s
 	_, _ = w.Write(b)
 }
 
-// serveDeployedApp reverse-proxies an HTTP request to a deployed app's local port.
+// serveDeployedApp reverse-proxies an HTTP request to a deployed app's local address.
 func (s *Server) serveDeployedApp(w http.ResponseWriter, r *http.Request, app *deployedApp) {
-	if app.port == 0 {
+	if app.listenAddr == "" {
 		http.Error(w, "app not ready", http.StatusServiceUnavailable)
 		return
 	}
@@ -293,7 +303,7 @@ func (s *Server) serveDeployedApp(w http.ResponseWriter, r *http.Request, app *d
 
 	target := &url.URL{
 		Scheme: "http",
-		Host:   fmt.Sprintf("127.0.0.1:%d", app.port),
+		Host:   app.listenAddr,
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
@@ -375,21 +385,31 @@ func snapshotListeningPorts() map[int]bool {
 }
 
 // detectContainerPort polls the host's listening ports until a new one appears
-// that wasn't in knownPorts (i.e. the app's port). Works for any port the app
-// chooses regardless of PORT env var, framework defaults, or custom config.
-func detectContainerPort(knownPorts map[int]bool, timeout time.Duration) (int, error) {
+// that wasn't in knownPorts, then probes both 127.0.0.1 and [::1] to find the
+// address that actually accepts connections (app may bind IPv6-only or IPv4-only).
+// Returns a host:port string ready for use as a reverse-proxy target.
+func detectContainerPort(knownPorts map[int]bool, timeout time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		out, _ := exec.Command("ss", "-Htln").Output()
 		for _, line := range strings.Split(string(out), "\n") {
 			p := parseSSPort(line)
-			if p > 1024 && !knownPorts[p] {
-				return p, nil
+			if p <= 1024 || knownPorts[p] {
+				continue
+			}
+			// Found a new port — determine connectable address.
+			for _, host := range []string{"127.0.0.1", "[::1]"} {
+				addr := net.JoinHostPort(strings.Trim(host, "[]"), strconv.Itoa(p))
+				conn, err := net.DialTimeout("tcp", addr, time.Second)
+				if err == nil {
+					conn.Close()
+					return addr, nil
+				}
 			}
 		}
 		time.Sleep(2 * time.Second)
 	}
-	return 0, fmt.Errorf("app did not start listening within %s", timeout)
+	return "", fmt.Errorf("app did not start listening within %s", timeout)
 }
 
 // parseSSPort extracts the port number from one line of `ss -Htln` output.
