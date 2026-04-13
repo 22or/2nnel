@@ -81,6 +81,8 @@ func (s *Server) Run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	s.loadState()
+
 	go func() {
 		<-ctx.Done()
 		slog.Info("shutdown signal")

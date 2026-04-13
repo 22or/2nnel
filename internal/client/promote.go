@@ -82,18 +82,26 @@ func (s *session) handlePromote(p proto.Promote) {
 		req.Header.Set("Authorization", "Bearer "+authToken)
 	}
 
+	sendErr := func(msg string) {
+		slog.Error("promote: "+msg, "tunnel", p.TunnelName)
+		_ = s.ctrl.Send(proto.TypePromoteError, proto.PromoteError{
+			TunnelName: p.TunnelName,
+			Error:      msg,
+		})
+	}
+
 	slog.Info("promote: uploading tarball", "tunnel", p.TunnelName, "url", endpoint)
 	httpClient := &http.Client{Timeout: 10 * time.Minute}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		slog.Error("promote: upload failed", "tunnel", p.TunnelName, "err", err)
+		sendErr("upload failed: " + err.Error())
 		return
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		slog.Error("promote: server error", "tunnel", p.TunnelName, "status", resp.StatusCode, "body", string(body))
+		sendErr(fmt.Sprintf("server error %d: %s", resp.StatusCode, strings.TrimSpace(string(body))))
 		return
 	}
 	slog.Info("promote: deployed successfully", "tunnel", p.TunnelName, "response", string(body))

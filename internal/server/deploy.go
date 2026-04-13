@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bufio"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -74,6 +75,93 @@ func (b *pendingBuild) snapshot() (lines []string, errMsg string, done bool) {
 	return lines, b.errMsg, b.done
 }
 
+// ── State persistence ─────────────────────────────────────────────────────────
+
+// persistedApp is the JSON-serializable form of a deployedApp.
+type persistedApp struct {
+	Name        string    `json:"name"`
+	ContainerID string    `json:"container_id"`
+	ListenAddr  string    `json:"listen_addr"`
+	Port        int       `json:"port"`
+	Dir         string    `json:"dir"`
+	StartedAt   time.Time `json:"started_at"`
+}
+
+func (s *Server) stateFile() string {
+	dir := s.cfg.DeployDir
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, "2nnel-state.json")
+}
+
+// saveState persists all current deployedApps to disk.
+func (s *Server) saveState() {
+	var apps []persistedApp
+	s.deployedApps.Range(func(k, v any) bool {
+		app := v.(*deployedApp)
+		apps = append(apps, persistedApp{
+			Name:        app.name,
+			ContainerID: app.containerID,
+			ListenAddr:  app.listenAddr,
+			Port:        app.port,
+			Dir:         app.dir,
+			StartedAt:   app.startedAt,
+		})
+		return true
+	})
+	b, err := json.Marshal(apps)
+	if err != nil {
+		slog.Error("saveState: marshal", "err", err)
+		return
+	}
+	if err := os.WriteFile(s.stateFile(), b, 0600); err != nil {
+		slog.Error("saveState: write", "err", err)
+	}
+}
+
+// loadState reads state.json on startup and re-populates deployedApps,
+// skipping any containers that are no longer running in Docker.
+func (s *Server) loadState() {
+	data, err := os.ReadFile(s.stateFile())
+	if os.IsNotExist(err) {
+		return
+	}
+	if err != nil {
+		slog.Warn("loadState: read", "err", err)
+		return
+	}
+	var apps []persistedApp
+	if err := json.Unmarshal(data, &apps); err != nil {
+		slog.Warn("loadState: parse", "err", err)
+		return
+	}
+	for _, pa := range apps {
+		// Verify container is still running.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		out, err := exec.CommandContext(ctx, "docker", "inspect",
+			"--format", "{{.State.Status}}", "2nnel-"+pa.Name).Output()
+		cancel()
+		if err != nil || strings.TrimSpace(string(out)) != "running" {
+			slog.Info("loadState: container gone, skipping", "name", pa.Name)
+			continue
+		}
+		app := &deployedApp{
+			name:        pa.Name,
+			subdomain:   pa.Name,
+			containerID: pa.ContainerID,
+			listenAddr:  pa.ListenAddr,
+			port:        pa.Port,
+			dir:         pa.Dir,
+			startedAt:   pa.StartedAt,
+		}
+		s.deployedApps.Store(pa.Name, app)
+		slog.Info("loadState: restored deployed app", "name", pa.Name, "addr", pa.ListenAddr)
+	}
+}
+
+// ── Promote upload ────────────────────────────────────────────────────────────
+
 // handlePromoteUpload handles POST /_2nnel/promote — receives a tarball, builds with
 // Nixpacks, and runs the resulting Docker image permanently.
 func (s *Server) handlePromoteUpload(w http.ResponseWriter, r *http.Request) {
@@ -100,6 +188,10 @@ func (s *Server) handlePromoteUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("app %q already deployed — stop it first", name), http.StatusConflict)
 		return
 	}
+	if _, exists := s.pendingBuilds.Load(name); exists {
+		http.Error(w, fmt.Sprintf("app %q is already building", name), http.StatusConflict)
+		return
+	}
 
 	tarFile, _, err := r.FormFile("tarball")
 	if err != nil {
@@ -124,14 +216,22 @@ func (s *Server) handlePromoteUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Register a pending build so the dashboard can show live progress.
+	// Register pending build for dashboard visibility.
 	build := &pendingBuild{name: name, startedAt: time.Now()}
 	s.pendingBuilds.Store(name, build)
+
+	// Snapshot existing ports before container starts (Fix 4).
+	knownPorts, err := snapshotListeningPorts()
+	if err != nil {
+		s.pendingBuilds.Delete(name)
+		os.RemoveAll(dir)
+		http.Error(w, "ss failed — cannot detect app port: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	// Build with Nixpacks — stream output line-by-line into build log.
 	slog.Info("promote: nixpacks build", "name", name, "dir", dir)
 	nixCmd := exec.Command("nixpacks", "build", dir, "--name", name)
-	nixCmd.Env = append(os.Environ(), "DOCKER_BUILDKIT=0")
 	pr, pw := io.Pipe()
 	nixCmd.Stdout = pw
 	nixCmd.Stderr = pw
@@ -145,23 +245,29 @@ func (s *Server) handlePromoteUpload(w http.ResponseWriter, r *http.Request) {
 	}()
 	buildErr := nixCmd.Run()
 	pw.Close()
-	<-scanDone // ensure all output is captured before we inspect it
+	<-scanDone
 
 	if buildErr != nil {
 		lines, _, _ := build.snapshot()
-		buildLog := strings.Join(lines, "\n")
 		slog.Error("promote: nixpacks build failed", "name", name, "err", buildErr)
 		build.finish("nixpacks build failed: " + buildErr.Error())
 		os.RemoveAll(dir)
-		http.Error(w, fmt.Sprintf("nixpacks build failed:\n%s", buildLog), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("nixpacks build failed:\n%s", strings.Join(lines, "\n")), http.StatusInternalServerError)
 		return
 	}
 	build.appendLine("✓ Build complete — starting container…")
 	slog.Info("promote: nixpacks build complete", "name", name)
 
-	// Build docker run args. Use --network host so the container shares the host's
-	// network namespace — no port mapping needed, and we can detect the actual
-	// listening port at runtime regardless of what the app uses.
+	// Force-remove any stale container with this name before starting a new one (Fix 5/8).
+	ctx30 := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.Background(), 30*time.Second)
+	}
+	rmCtx, rmCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	if out, err := exec.CommandContext(rmCtx, "docker", "rm", "-f", "2nnel-"+name).CombinedOutput(); err != nil {
+		slog.Debug("promote: pre-run rm (expected if no stale container)", "name", name, "out", strings.TrimSpace(string(out)))
+	}
+	rmCancel()
+
 	args := []string{
 		"run", "-d", "--restart=unless-stopped",
 		"--network", "host",
@@ -173,36 +279,31 @@ func (s *Server) handlePromoteUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	args = append(args, name)
 
-	// Snapshot ports already listening on the host BEFORE the container starts.
-	// With --network host the container shares host network, so we detect the app's
-	// port by looking for a new port that wasn't there before docker run.
-	knownPorts := snapshotListeningPorts()
-
 	build.appendLine("Starting container…")
 	slog.Info("promote: docker run", "name", name)
-	out, err := exec.Command("docker", args...).Output()
+	runCtx, runCancel := ctx30()
+	out, err := exec.CommandContext(runCtx, "docker", append([]string{}, args...)...).Output()
+	runCancel()
 	if err != nil {
 		build.finish("docker run failed: " + err.Error())
+		cleanupContainer(name, "")
 		os.RemoveAll(dir)
 		http.Error(w, fmt.Sprintf("docker run failed: %v", err), http.StatusInternalServerError)
 		return
 	}
 	containerID := strings.TrimSpace(string(out))
 
-	// Poll host ports until a new one appears, then probe IPv4/IPv6 to find
-	// the actual connectable address (app may bind to ::1 not 127.0.0.1).
-	listenAddr, err := detectContainerPort(knownPorts, 60*time.Second)
+	// Poll host ports for a new one, verify it accepts HTTP (Fix 6/7).
+	listenAddr, err := detectContainerPort(knownPorts, 5*time.Minute)
 	if err != nil {
-		build.finish("container started but app never listened: " + err.Error())
-		exec.Command("docker", "stop", containerID).Run()
-		exec.Command("docker", "rm", containerID).Run()
+		build.finish("app never started listening: " + err.Error())
+		cleanupContainer(name, containerID)
 		os.RemoveAll(dir)
 		http.Error(w, "detect app port: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	slog.Info("promote: app listening", "name", name, "addr", listenAddr)
 
-	// Parse port number from listenAddr for display.
 	displayPort := 0
 	if _, portStr, splitErr := net.SplitHostPort(listenAddr); splitErr == nil {
 		displayPort, _ = strconv.Atoi(portStr)
@@ -217,12 +318,11 @@ func (s *Server) handlePromoteUpload(w http.ResponseWriter, r *http.Request) {
 		dir:         dir,
 		startedAt:   time.Now(),
 	}
-	// Store deployed app so traffic routes to Docker immediately,
-	// then remove the pending build — it's now visible as a deployed app.
 	s.deployedApps.Store(name, app)
 	s.pendingBuilds.Delete(name)
+	s.saveState() // Fix 1
 
-	// Evict the client tunnel using this subdomain (if any) — it handed off to Docker.
+	// Evict any client tunnel using this subdomain.
 	s.registry.mu.RLock()
 	evictEntry := s.registry.bySubdomain[name]
 	s.registry.mu.RUnlock()
@@ -239,6 +339,20 @@ func (s *Server) handlePromoteUpload(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"ok":true,"url":%q}`, publicURL)
 }
 
+// cleanupContainer stops and removes the Docker container for a named app.
+func cleanupContainer(name, containerID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, "docker", "stop", "2nnel-"+name).CombinedOutput(); err != nil {
+		slog.Warn("cleanup: docker stop failed", "name", name, "err", err, "out", strings.TrimSpace(string(out)))
+	}
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel2()
+	if out, err := exec.CommandContext(ctx2, "docker", "rm", "2nnel-"+name).CombinedOutput(); err != nil {
+		slog.Warn("cleanup: docker rm failed", "name", name, "err", err, "out", strings.TrimSpace(string(out)))
+	}
+}
+
 // stopApp stops and removes a deployed app's container, image, and files.
 func (s *Server) stopApp(name string) bool {
 	val, ok := s.deployedApps.Load(name)
@@ -247,11 +361,29 @@ func (s *Server) stopApp(name string) bool {
 	}
 	app := val.(*deployedApp)
 
-	exec.Command("docker", "stop", "2nnel-"+app.name).Run()
-	exec.Command("docker", "rm", "2nnel-"+app.name).Run()
-	exec.Command("docker", "rmi", app.name).Run()
-	os.RemoveAll(app.dir)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if out, err := exec.CommandContext(ctx, "docker", "stop", "2nnel-"+app.name).CombinedOutput(); err != nil {
+		slog.Warn("stopApp: docker stop", "name", name, "err", err, "out", strings.TrimSpace(string(out)))
+	}
+	cancel()
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
+	if out, err := exec.CommandContext(ctx2, "docker", "rm", "2nnel-"+app.name).CombinedOutput(); err != nil {
+		slog.Warn("stopApp: docker rm", "name", name, "err", err, "out", strings.TrimSpace(string(out)))
+	}
+	cancel2()
+
+	ctx3, cancel3 := context.WithTimeout(context.Background(), 15*time.Second)
+	if out, err := exec.CommandContext(ctx3, "docker", "rmi", app.name).CombinedOutput(); err != nil {
+		slog.Warn("stopApp: docker rmi", "name", name, "err", err, "out", strings.TrimSpace(string(out)))
+	}
+	cancel3()
+
+	if err := os.RemoveAll(app.dir); err != nil {
+		slog.Warn("stopApp: remove dir", "name", name, "dir", app.dir, "err", err)
+	}
 	s.deployedApps.Delete(name)
+	s.saveState() // Fix 1
 	slog.Info("deployed app stopped", "name", name)
 	return true
 }
@@ -260,7 +392,9 @@ func (s *Server) stopApp(name string) bool {
 func (s *Server) stopAllDeployedApps() {
 	s.deployedApps.Range(func(k, v any) bool {
 		app := v.(*deployedApp)
-		exec.Command("docker", "stop", "2nnel-"+app.name).Run()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		exec.CommandContext(ctx, "docker", "stop", "2nnel-"+app.name).Run()
+		cancel()
 		return true
 	})
 }
@@ -283,7 +417,9 @@ func (s *Server) handleDeployLogs(w http.ResponseWriter, r *http.Request, name s
 		return
 	}
 	app := val.(*deployedApp)
-	out, _ := exec.Command("docker", "logs", "--tail", "50", "2nnel-"+app.name).CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, _ := exec.CommandContext(ctx, "docker", "logs", "--tail", "50", "2nnel-"+app.name).CombinedOutput()
 	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
 	w.Header().Set("Content-Type", "application/json")
 	b, _ := json.Marshal(lines)
@@ -313,6 +449,81 @@ func (s *Server) serveDeployedApp(w http.ResponseWriter, r *http.Request, app *d
 	proxy.ServeHTTP(w, r)
 }
 
+// ── Port detection ────────────────────────────────────────────────────────────
+
+// knownDebugPorts lists ports that apps commonly open for debugging/monitoring
+// before their main HTTP server — skip these during port detection (Fix 7).
+var knownDebugPorts = map[int]bool{
+	9229: true, // Node.js --inspect
+	9230: true, // Node.js --inspect (alternate)
+	9090: true, // Prometheus metrics
+	8125: true, // StatsD
+}
+
+// snapshotListeningPorts returns the set of TCP ports currently listening on
+// the host, or an error if ss is unavailable (Fix 4).
+func snapshotListeningPorts() (map[int]bool, error) {
+	out, err := exec.Command("ss", "-Htln").Output()
+	if err != nil {
+		return nil, fmt.Errorf("ss: %w", err)
+	}
+	ports := map[int]bool{}
+	for _, line := range strings.Split(string(out), "\n") {
+		if p := parseSSPort(line); p > 0 {
+			ports[p] = true
+		}
+	}
+	return ports, nil
+}
+
+// detectContainerPort polls the host's listening ports until a new one appears
+// that wasn't in knownPorts and accepts TCP connections (Fix 6 — 5 min timeout).
+// Skips known debug/metrics ports (Fix 7).
+func detectContainerPort(knownPorts map[int]bool, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		out, _ := exec.Command("ss", "-Htln").Output()
+		for _, line := range strings.Split(string(out), "\n") {
+			p := parseSSPort(line)
+			if p <= 1024 || knownPorts[p] || knownDebugPorts[p] {
+				continue
+			}
+			// Probe both IPv4 and IPv6 — return whichever accepts connections.
+			for _, host := range []string{"127.0.0.1", "::1"} {
+				addr := net.JoinHostPort(host, strconv.Itoa(p))
+				conn, err := net.DialTimeout("tcp", addr, time.Second)
+				if err == nil {
+					conn.Close()
+					return addr, nil
+				}
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return "", fmt.Errorf("app did not start listening within %s", timeout)
+}
+
+// parseSSPort extracts the port number from one line of `ss -Htln` output.
+// Handles IPv4 (0.0.0.0:port), IPv6 (:::port, [::1]:port), and wildcard (*:port).
+func parseSSPort(line string) int {
+	fields := strings.Fields(line)
+	if len(fields) < 4 {
+		return 0
+	}
+	addr := fields[3]
+	i := strings.LastIndex(addr, ":")
+	if i < 0 {
+		return 0
+	}
+	p, err := strconv.Atoi(addr[i+1:])
+	if err != nil {
+		return 0
+	}
+	return p
+}
+
+// ── Tarball extraction ────────────────────────────────────────────────────────
+
 // extractTarball extracts a gzipped tar archive into dir.
 func extractTarball(r io.Reader, dir string) error {
 	gr, err := gzip.NewReader(r)
@@ -333,7 +544,6 @@ func extractTarball(r io.Reader, dir string) error {
 			return fmt.Errorf("tar: %w", err)
 		}
 
-		// Sanitize path — prevent traversal.
 		clean := filepath.Clean(hdr.Name)
 		if filepath.IsAbs(clean) || strings.HasPrefix(clean, "..") {
 			continue
@@ -349,7 +559,7 @@ func extractTarball(r io.Reader, dir string) error {
 			if err := os.MkdirAll(target, 0755); err != nil {
 				return fmt.Errorf("mkdir %s: %w", target, err)
 			}
-		default: // treat everything else as a regular file
+		default:
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return fmt.Errorf("mkdir parent: %w", err)
 			}
@@ -367,69 +577,7 @@ func extractTarball(r io.Reader, dir string) error {
 	return nil
 }
 
-// snapshotListeningPorts returns the set of TCP ports currently listening on
-// the host. Used to establish a baseline before docker run so we can detect
-// the app's port by diffing before/after (--network host shares host netns).
-func snapshotListeningPorts() map[int]bool {
-	ports := map[int]bool{}
-	out, err := exec.Command("ss", "-Htln").Output()
-	if err != nil {
-		return ports
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		if p := parseSSPort(line); p > 1024 {
-			ports[p] = true
-		}
-	}
-	return ports
-}
-
-// detectContainerPort polls the host's listening ports until a new one appears
-// that wasn't in knownPorts, then probes both 127.0.0.1 and [::1] to find the
-// address that actually accepts connections (app may bind IPv6-only or IPv4-only).
-// Returns a host:port string ready for use as a reverse-proxy target.
-func detectContainerPort(knownPorts map[int]bool, timeout time.Duration) (string, error) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		out, _ := exec.Command("ss", "-Htln").Output()
-		for _, line := range strings.Split(string(out), "\n") {
-			p := parseSSPort(line)
-			if p <= 1024 || knownPorts[p] {
-				continue
-			}
-			// Found a new port — determine connectable address.
-			for _, host := range []string{"127.0.0.1", "[::1]"} {
-				addr := net.JoinHostPort(strings.Trim(host, "[]"), strconv.Itoa(p))
-				conn, err := net.DialTimeout("tcp", addr, time.Second)
-				if err == nil {
-					conn.Close()
-					return addr, nil
-				}
-			}
-		}
-		time.Sleep(2 * time.Second)
-	}
-	return "", fmt.Errorf("app did not start listening within %s", timeout)
-}
-
-// parseSSPort extracts the port number from one line of `ss -Htln` output.
-// Local address field format: "0.0.0.0:4200", ":::3000", "*:8080".
-func parseSSPort(line string) int {
-	fields := strings.Fields(line)
-	if len(fields) < 4 {
-		return 0
-	}
-	addr := fields[3]
-	i := strings.LastIndex(addr, ":")
-	if i < 0 {
-		return 0
-	}
-	p, err := strconv.Atoi(addr[i+1:])
-	if err != nil {
-		return 0
-	}
-	return p
-}
+// ── Misc ──────────────────────────────────────────────────────────────────────
 
 // isValidDeployName returns true if name is alphanumeric+hyphen and ≤40 chars.
 func isValidDeployName(name string) bool {

@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/2nnel server \
+ExecStart=/usr/local/bin/2nnel-server \
     --domain your.domain.com \
     --port 443 \
     --auth-token changeme \

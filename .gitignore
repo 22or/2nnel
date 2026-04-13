@@ -1,9 +1,14 @@
 # Binaries
 2nnel
+2nnel-server
 2nnel-linux-amd64
 2nnel-linux-arm64
 2nnel-darwin-amd64
 2nnel-darwin-arm64
+2nnel-server-linux-amd64
+2nnel-server-linux-arm64
+2nnel-server-darwin-amd64
+2nnel-server-darwin-arm64
 *.exe
 
 # Build artifacts

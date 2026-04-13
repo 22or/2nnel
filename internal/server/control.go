@@ -126,6 +126,15 @@ func (h *controlHandler) loop(ctrl *proto.ControlConn) {
 		case proto.TypeHeartbeat:
 			// lastSeen already updated
 
+		case proto.TypePromoteError:
+			var pe proto.PromoteError
+			if err := env.Unmarshal(&pe); err == nil {
+				slog.Error("promote error from client", "tunnel", pe.TunnelName, "err", pe.Error)
+				if v, ok := h.server.pendingBuilds.Load(pe.TunnelName); ok {
+					v.(*pendingBuild).finish("client error: " + pe.Error)
+				}
+			}
+
 		default:
 			slog.Warn("unknown control message", "type", env.Type)
 		}

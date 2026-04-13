@@ -2,6 +2,7 @@ package server
 
 import (
 	_ "embed"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -248,7 +249,9 @@ func (s *Server) buildSSEPayload() ssePayload {
 	var deployedApps []sseDeployedApp
 	s.deployedApps.Range(func(k, v any) bool {
 		app := v.(*deployedApp)
-		out, _ := exec.Command("docker", "logs", "--tail", "10", "2nnel-"+app.name).CombinedOutput()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		out, _ := exec.CommandContext(ctx, "docker", "logs", "--tail", "10", "2nnel-"+app.name).CombinedOutput()
+		cancel()
 		recentLogs := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
 		if len(recentLogs) == 1 && recentLogs[0] == "" {
 			recentLogs = nil
