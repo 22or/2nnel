@@ -1,6 +1,6 @@
 # 2nnel
 
-Self-hosted reverse tunnel. Exposes local services to the internet through outbound-only connections — no accounts, no cloud, no per-seat pricing. Drop-in replacement for ngrok or Cloudflare Tunnel on infrastructure you control.
+Self-hosted reverse tunnel + deployment pipeline. Exposes local services to the internet through outbound-only connections. Promote services from your laptop to the tunnel server to make them permanent. Drop-in replacement for ngrok with one-click deploy, multiplying the velocity of apps moving from localhost to your domain.
 
 ```
 [Browser] ──► [2nnel-server on VPS] ◄══outbound WebSocket══ [2nnel on laptop]
@@ -11,8 +11,7 @@ Self-hosted reverse tunnel. Exposes local services to the internet through outbo
 
 - **You own the infra.** One VPS, one binary. No data transits third-party servers.
 - **Zero friction.** A tunnel is one command. No account creation, no dashboard login, no agent config file required to get started.
-- **Promote when ready.** A tunnel running locally can be promoted to run permanently on the server with one click — the server builds it via Nixpacks and runs it in Docker. No Dockerfile needed on the client.
-- **Production is your problem.** 2nnel gets your app online. Whether it's production-ready is up to you.
+- **Easy tunnel promotion** A tunnel running locally can be promoted to run permanently on the server with one click — the server builds it via Nixpacks and runs it in Docker. No Dockerfile needed on the client.
 
 ---
 
