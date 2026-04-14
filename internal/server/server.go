@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -143,6 +144,25 @@ func (s *Server) adminAuth(next http.Handler) http.Handler {
 // buildPublicHTTPURL constructs the full public URL for an HTTP tunnel subdomain.
 func (s *Server) buildPublicHTTPURL(subdomain string) string {
 	cfg := s.cfg
+
+	// PublicURL takes precedence — set when running behind a reverse proxy where
+	// the external scheme/port differ from what the server process sees.
+	if cfg.PublicURL != "" {
+		u, err := url.Parse(cfg.PublicURL)
+		if err == nil && u.Host != "" {
+			scheme := u.Scheme
+			if scheme == "" {
+				scheme = "https"
+			}
+			host := u.Hostname()
+			port := u.Port()
+			if port == "" || (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+				return fmt.Sprintf("%s://%s.%s", scheme, subdomain, host)
+			}
+			return fmt.Sprintf("%s://%s.%s:%s", scheme, subdomain, host, port)
+		}
+	}
+
 	if cfg.Domain == "" {
 		return fmt.Sprintf("(subdomain: %s)", subdomain)
 	}
@@ -193,6 +213,7 @@ type Registry struct {
 
 type clientEntry struct {
 	id          string
+	name        string
 	remote      string
 	connectedAt time.Time
 	session     *yamux.Session
@@ -394,6 +415,7 @@ func (reg *Registry) snapshot() []clientSnapshot {
 		e.mu.RUnlock()
 		out = append(out, clientSnapshot{
 			ID:          e.id,
+			Name:        e.name,
 			Remote:      e.remote,
 			ConnectedAt: e.connectedAt,
 			Tunnels:     ts,
@@ -404,6 +426,7 @@ func (reg *Registry) snapshot() []clientSnapshot {
 
 type clientSnapshot struct {
 	ID          string
+	Name        string
 	Remote      string
 	ConnectedAt time.Time
 	Tunnels     []tunnelSnapshot

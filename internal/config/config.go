@@ -13,10 +13,12 @@ type ServerConfig struct {
 	TCPPortMin   int
 	TCPPortMax   int
 	DeployDir    string // base dir for deployed app binaries (default: os.TempDir())
+	PublicURL    string // public base URL (overrides scheme+port when behind a reverse proxy)
 }
 
 // ClientConfig holds all client-side settings (from flags or YAML).
 type ClientConfig struct {
+	Name       string         `mapstructure:"name"       yaml:"name,omitempty"`
 	Server     string         `mapstructure:"server"     yaml:"server"`
 	AuthToken  string         `mapstructure:"auth_token" yaml:"auth_token"`
 	Tunnels    []TunnelConfig `mapstructure:"tunnels"    yaml:"tunnels"`

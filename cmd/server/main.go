@@ -45,6 +45,7 @@ func init() {
 	rootCmd.Flags().IntSlice("allowed-ports", nil, "Allowed TCP ports for TCP tunnels (empty = all)")
 	rootCmd.Flags().String("tcp-port-range", "", "Port range for auto-assigned TCP tunnels (e.g. 2200-2300)")
 	rootCmd.Flags().String("deploy-dir", "", "Base directory for deployed app files (default: system temp dir)")
+	rootCmd.Flags().String("public-url", "", "Public base URL (e.g. https://tunnel.example.com) — overrides scheme/port when running behind a reverse proxy")
 }
 
 func runServer(cmd *cobra.Command, _ []string) error {
@@ -62,6 +63,7 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	allowedPorts, _ := f.GetIntSlice("allowed-ports")
 	tcpPortRange, _ := f.GetString("tcp-port-range")
 	deployDir, _ := f.GetString("deploy-dir")
+	publicURL, _ := f.GetString("public-url")
 
 	tcpPortMin, tcpPortMax, err := parseTCPPortRange(tcpPortRange)
 	if err != nil {
@@ -80,6 +82,7 @@ func runServer(cmd *cobra.Command, _ []string) error {
 		TCPPortMin:   tcpPortMin,
 		TCPPortMax:   tcpPortMax,
 		DeployDir:    deployDir,
+		PublicURL:    publicURL,
 	}
 
 	if dev && !cmd.Flags().Changed("port") {

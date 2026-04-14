@@ -13,10 +13,11 @@ import (
 
 // controlHandler manages a single client's control session.
 type controlHandler struct {
-	server   *Server
-	session  *yamux.Session
-	remote   string
-	clientID string
+	server     *Server
+	session    *yamux.Session
+	remote     string
+	clientID   string
+	clientName string
 }
 
 func (h *controlHandler) run() {
@@ -30,7 +31,7 @@ func (h *controlHandler) run() {
 
 	ctrl := proto.NewControlConn(ctrlStream)
 
-	h.clientID, err = h.authenticate(ctrl)
+	h.clientID, h.clientName, err = h.authenticate(ctrl)
 	if err != nil {
 		slog.Warn("auth failed", "remote", h.remote, "err", err)
 		_ = ctrlStream.Close()
@@ -38,10 +39,11 @@ func (h *controlHandler) run() {
 		return
 	}
 
-	slog.Info("client authenticated", "id", h.clientID, "remote", h.remote)
+	slog.Info("client authenticated", "id", h.clientID, "name", h.clientName, "remote", h.remote)
 
 	entry := &clientEntry{
 		id:          h.clientID,
+		name:        h.clientName,
 		remote:      h.remote,
 		connectedAt: time.Now(),
 		session:     h.session,
@@ -51,36 +53,36 @@ func (h *controlHandler) run() {
 	defer h.server.registry.removeClient(h.clientID)
 	defer func() {
 		_ = h.session.Close()
-		slog.Info("client disconnected", "id", h.clientID, "remote", h.remote)
+		slog.Info("client disconnected", "id", h.clientID, "name", h.clientName, "remote", h.remote)
 	}()
 
 	h.loop(ctrl)
 }
 
-func (h *controlHandler) authenticate(ctrl *proto.ControlConn) (string, error) {
+func (h *controlHandler) authenticate(ctrl *proto.ControlConn) (string, string, error) {
 	env, err := ctrl.Recv()
 	if err != nil {
-		return "", fmt.Errorf("read auth: %w", err)
+		return "", "", fmt.Errorf("read auth: %w", err)
 	}
 	if env.Type != proto.TypeAuth {
-		return "", fmt.Errorf("expected auth, got %q", env.Type)
+		return "", "", fmt.Errorf("expected auth, got %q", env.Type)
 	}
 	var authMsg proto.Auth
 	if err := env.Unmarshal(&authMsg); err != nil {
-		return "", fmt.Errorf("decode auth: %w", err)
+		return "", "", fmt.Errorf("decode auth: %w", err)
 	}
 
 	token := h.server.cfg.AuthToken
 	if token != "" && authMsg.Token != token {
 		_ = ctrl.Send(proto.TypeAuthError, proto.AuthError{Error: "invalid token"})
-		return "", fmt.Errorf("invalid token")
+		return "", "", fmt.Errorf("invalid token")
 	}
 
 	clientID := newID()
 	if err := ctrl.Send(proto.TypeAuthAck, proto.AuthAck{ClientID: clientID}); err != nil {
-		return "", fmt.Errorf("send auth_ack: %w", err)
+		return "", "", fmt.Errorf("send auth_ack: %w", err)
 	}
-	return clientID, nil
+	return clientID, authMsg.Name, nil
 }
 
 func (h *controlHandler) loop(ctrl *proto.ControlConn) {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -42,6 +43,7 @@ func init() {
 	rootCmd.Flags().String("auth-token", "", "Auth token for server")
 	rootCmd.Flags().StringP("config", "c", "", "Config file path (YAML)")
 	rootCmd.Flags().String("dir", "", "Project directory for promote (single-tunnel mode only)")
+	rootCmd.Flags().String("name", "", "Display name for this client in the dashboard")
 
 	rootCmd.AddCommand(shareCmd)
 	rootCmd.AddCommand(installCmd)
@@ -54,6 +56,7 @@ func runClient(cmd *cobra.Command, _ []string) error {
 	slog.SetDefault(logger)
 
 	cfgFile, _ := cmd.Flags().GetString("config")
+	nameFlag, _ := cmd.Flags().GetString("name")
 
 	var cfg *config.ClientConfig
 
@@ -66,6 +69,7 @@ func runClient(cmd *cobra.Command, _ []string) error {
 		if err := viper.Unmarshal(cfg); err != nil {
 			return fmt.Errorf("parse config: %w", err)
 		}
+		cfg.ConfigFile = cfgFile
 	} else {
 		serverURL, _ := cmd.Flags().GetString("server")
 		authToken, _ := cmd.Flags().GetString("auth-token")
@@ -91,8 +95,60 @@ func runClient(cmd *cobra.Command, _ []string) error {
 		}
 	}
 
+	// Resolve client name: flag > config > prompt > hostname fallback.
+	if nameFlag != "" {
+		cfg.Name = nameFlag
+	}
+	if cfg.Name == "" {
+		cfg.Name = resolveClientName(cfg.ConfigFile != "")
+		// Persist if we have a config file and a non-empty name.
+		if cfg.ConfigFile != "" && cfg.Name != "" {
+			if b, err := yaml.Marshal(cfg); err == nil {
+				_ = os.WriteFile(cfg.ConfigFile, b, 0600)
+			}
+		}
+	}
+	fmt.Printf("→ Client name: %s\n", cfg.Name)
+
 	c := client.New(cfg)
 	return c.Run()
+}
+
+// resolveClientName prompts the user to name this client when stdin is a TTY.
+// Falls back to the machine hostname otherwise. suggestedPersist is informational —
+// it slightly changes the prompt text.
+func resolveClientName(persist bool) string {
+	host, _ := os.Hostname()
+	if host == "" {
+		host = "client"
+	}
+	if !isInteractiveStdin() {
+		return host
+	}
+	if persist {
+		fmt.Printf("Name this client [%s]: ", host)
+	} else {
+		fmt.Printf("Name this client (shown in dashboard) [%s]: ", host)
+	}
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return host
+	}
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return host
+	}
+	return line
+}
+
+// isInteractiveStdin returns true if stdin is a character device (TTY).
+func isInteractiveStdin() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
 // ── Share ──────────────────────────────────────────────────────────────────────
@@ -203,6 +259,7 @@ func init() {
 	installCmd.Flags().String("auth-token", "", "Auth token")
 	installCmd.Flags().StringArray("tunnel", nil, "Tunnel spec (same format as root command)")
 	installCmd.Flags().String("config-dir", "/etc/2nnel", "Directory for config file")
+	installCmd.Flags().String("name", "", "Display name for this client in the dashboard")
 }
 
 const serviceTemplate = `[Unit]
@@ -230,6 +287,7 @@ func runInstall(cmd *cobra.Command, _ []string) error {
 	authToken, _ := f.GetString("auth-token")
 	tunnelSpecs, _ := f.GetStringArray("tunnel")
 	configDir, _ := f.GetString("config-dir")
+	name, _ := f.GetString("name")
 
 	if serverURL == "" {
 		return fmt.Errorf("--server required")
@@ -238,6 +296,10 @@ func runInstall(cmd *cobra.Command, _ []string) error {
 	tunnels, err := parseTunnelSpecs(tunnelSpecs)
 	if err != nil {
 		return err
+	}
+
+	if name == "" {
+		name = resolveClientName(true)
 	}
 
 	binaryPath, err := os.Executable()
@@ -251,6 +313,7 @@ func runInstall(cmd *cobra.Command, _ []string) error {
 	}
 	configFile := filepath.Join(configDir, "client.yaml")
 	cfg := &config.ClientConfig{
+		Name:       name,
 		Server:     serverURL,
 		AuthToken:  authToken,
 		Tunnels:    tunnels,

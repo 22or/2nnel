@@ -38,6 +38,7 @@ func (e *Envelope) Unmarshal(v any) error {
 type Auth struct {
 	Token   string `json:"token"`
 	Version string `json:"version"`
+	Name    string `json:"name"` // user-provided client name (display only)
 }
 
 // AuthAck is the server's success response to Auth.

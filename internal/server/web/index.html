@@ -225,7 +225,8 @@ function renderClient(c) {
   return `
     <div class="client-card mb-3">
       <div class="client-header px-4 py-2 d-flex align-items-center gap-3 flex-wrap">
-        <span class="font-monospace fw-bold" style="color:#e6edf3;">${escHtml(c.short_id)}</span>
+        <span class="fw-bold" style="color:#e6edf3;font-size:0.95rem;">${escHtml(c.name || c.short_id)}</span>
+        <span class="font-monospace text-secondary" style="font-size:0.75rem;">${escHtml(c.short_id)}</span>
         <span class="text-secondary" style="font-size:0.8rem;">${escHtml(c.remote)}</span>
         <span class="text-secondary" style="font-size:0.8rem;">· connected ${escHtml(c.connected_ago)}</span>
         <span class="ms-auto d-flex gap-2">

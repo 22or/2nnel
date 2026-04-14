@@ -59,6 +59,7 @@ func (s *session) connect() error {
 	if err := ctrl.Send(proto.TypeAuth, proto.Auth{
 		Token:   s.cfg.AuthToken,
 		Version: "1.0",
+		Name:    s.cfg.Name,
 	}); err != nil {
 		_ = mux.Close()
 		return fmt.Errorf("send auth: %w", err)

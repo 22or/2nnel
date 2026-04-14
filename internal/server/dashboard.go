@@ -152,6 +152,7 @@ type sseDeployedApp struct {
 type sseClient struct {
 	ID           string       `json:"id"`
 	ShortID      string       `json:"short_id"`
+	Name         string       `json:"name"`
 	Remote       string       `json:"remote"`
 	ConnectedAt  string       `json:"connected_at"`
 	ConnectedAgo string       `json:"connected_ago"`
@@ -207,15 +208,8 @@ func (s *Server) buildSSEPayload() ssePayload {
 			totals.TotalBytesOut += t.BytesOut
 
 			endpoint := t.Endpoint
-			if t.Type == "http" && s.cfg.Domain != "" {
-				scheme := "https"
-				if s.cfg.Dev {
-					scheme = "http"
-				}
-				endpoint = scheme + "://" + t.Endpoint + "." + s.cfg.Domain
-				if s.cfg.Dev && s.cfg.Port != 80 && s.cfg.Port != 443 {
-					endpoint += fmt.Sprintf(":%d", s.cfg.Port)
-				}
+			if t.Type == "http" {
+				endpoint = s.buildPublicHTTPURL(t.Endpoint)
 			}
 
 			tunnels = append(tunnels, sseTunnel{
@@ -238,6 +232,7 @@ func (s *Server) buildSSEPayload() ssePayload {
 		clients = append(clients, sseClient{
 			ID:           snap.ID,
 			ShortID:      shortID,
+			Name:         snap.Name,
 			Remote:       snap.Remote,
 			ConnectedAt:  snap.ConnectedAt.UTC().Format(time.RFC3339),
 			ConnectedAgo: fmtDuration(now.Sub(snap.ConnectedAt)),
